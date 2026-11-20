@@ -1,0 +1,432 @@
+/* WCCS C core - the single source of truth for all language bindings.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Pure C99, no host-language runtime, no floating point, no __int128.
+ * Every arithmetic path is integer / Q32 fixed point so that the same
+ * (seed, stream_id, parameters) produces the identical index sequence on
+ * every platform (L2 reproducibility, see docs/REPRODUCIBILITY.md).
+ */
+#include "wccs.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+#define ONE_Q32 (1ULL << 32)
+
+/* ------------------------------------------------------------------ *
+ * Portable 128-bit helpers (pure C99: no __int128, works on MSVC too)
+ * ------------------------------------------------------------------ */
+
+/* {hi, lo} = a * b, full unsigned 128-bit product. */
+static void mul128(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo)
+{
+    uint64_t a0 = (uint32_t)a, a1 = a >> 32;
+    uint64_t b0 = (uint32_t)b, b1 = b >> 32;
+    uint64_t p00 = a0 * b0;
+    uint64_t p01 = a0 * b1;
+    uint64_t p10 = a1 * b0;
+    uint64_t p11 = a1 * b1;
+
+    uint64_t mid = (p00 >> 32) + (uint32_t)p01 + (uint32_t)p10; /* < 3*2^32 */
+    *lo = (p00 & 0xffffffffULL) | (mid << 32);
+    *hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+}
+
+/* Low 64 bits of (a*b >> 32). Used for Q32 fixed-point multiplication. */
+static uint64_t mul128_shr32(uint64_t a, uint64_t b)
+{
+    uint64_t hi, lo;
+    mul128(a, b, &hi, &lo);
+    return (hi << 32) | (lo >> 32);
+}
+
+/* q = (hi:lo) / d, r = (hi:lo) % d. Requires hi < d so q fits in uint64.
+ * Bitwise long division with an explicit carry (no 128-bit type needed). */
+static uint64_t div128_64(uint64_t hi, uint64_t lo, uint64_t d, uint64_t *rem)
+{
+    uint64_t q = 0, r = hi;
+    int i;
+    for (i = 63; i >= 0; --i) {
+        uint64_t carry = r >> 63;
+        r = (r << 1) | ((lo >> i) & 1ULL);
+        if (carry || r >= d) {
+            r -= d;                 /* when carry==1 the true value is 2^64+r */
+            q |= (1ULL << i);
+        }
+    }
+    if (rem) *rem = r;
+    return q;
+}
+
+/* Bit-preserving reinterpretation, avoiding implementation-defined
+ * uint64 -> int64 conversions for values above INT64_MAX. */
+static int64_t u64_to_i64(uint64_t u)
+{
+    if (u <= (uint64_t)INT64_MAX) return (int64_t)u;
+    return (int64_t)(u - (1ULL << 63)) + INT64_MIN;
+}
+
+/* ------------------------------------------------------------------ *
+ * Reference PRNG: PCG RXS-M-XS 64/64 (64-bit state, 64-bit output)
+ * Deterministic, portable, no floating point. Exposed via wccs.h so any
+ * binding can inject the exact same engine if it does not use
+ * wccs_new_default().
+ * ------------------------------------------------------------------ */
+
+#define PCG_MULT 6364136223846793005ULL
+#define PCG_INC  1442695040888963407ULL
+#define PCG_M2   12605985483714917081ULL
+
+uint64_t wccs_pcg64_next(void *ctx)
+{
+    wccs_pcg64_t *p = (wccs_pcg64_t *)ctx;
+    uint64_t x = p->state;
+    unsigned count = (unsigned)(x >> 59);
+    p->state = x * PCG_MULT + PCG_INC;
+    x ^= x >> (5 + count);
+    x *= PCG_M2;
+    return x ^ (x >> 43);
+}
+
+void wccs_pcg64_init(wccs_pcg64_t *p, uint64_t seed, uint64_t stream_id)
+{
+    int k;
+    p->state = seed ^ (stream_id * 0x9E3779B97F4A7C15ULL
+                       + 0xBF58476D1CE4E5B9ULL);
+    for (k = 0; k < 8; ++k) (void)wccs_pcg64_next(p); /* warm up */
+}
+
+/* ------------------------------------------------------------------ *
+ * Context
+ * ------------------------------------------------------------------ */
+
+struct wccs_ctx {
+    int32_t  n, L, R;
+    uint64_t beta_q, alpha_q;
+    uint64_t seed, stream_id;
+    uint64_t W_total;              /* sum of base weights, checked for overflow */
+
+    uint64_t *w;                   /* copy of base weights,   [n]   */
+    uint64_t *bit;                 /* Fenwick tree,           [n+1] */
+    uint64_t *cur;                 /* current dynamic v_i,    [n]   */
+    uint64_t  total;               /* Fenwick sum                    */
+    uint64_t *actual;              /* sampled counts,         [n]   */
+    int64_t  *credit;              /* Q32 credit,             [n]   */
+    uint64_t *cooldown;            /* Q32 cooldown factor,    [n]   */
+
+    int32_t  *recent;              /* ring buffer,            [L]   */
+    int32_t   recent_head;         /* next write slot == oldest when full */
+    int32_t   recent_count;
+
+    uint64_t  step;
+    wccs_rng_t rng;
+    wccs_pcg64_t pcg;             /* owned by core for wccs_new_default */
+    int32_t   last_err;
+};
+
+/* ------------------------------------------------------------------ *
+ * Dynamic weight: v_i = max(0, w_i + (alpha_q*credit_i >> 64)) * cooldown_i >> 32
+ *
+ * credit_i is Q32 ("target - actual" counts), alpha_q is Q32 in [0, 2^32].
+ * Their product is Q64; >> 64 yields an integer count adjustment. The result
+ * is then multiplied by the Q32 cooldown factor and reduced by >> 32.
+ * All intermediates use the portable 128-bit helpers above.
+ * ------------------------------------------------------------------ */
+static uint64_t calc_v(const wccs_ctx *c, int32_t i)
+{
+    int64_t cr = c->credit[i];
+    int64_t delta = 0;
+
+    if (cr != 0 && c->alpha_q != 0) {
+        uint64_t mag = (uint64_t)cr;
+        uint64_t hi, lo;
+        if (cr < 0) mag = (~mag) + 1ULL;          /* two's-complement abs */
+        mul128(c->alpha_q, mag, &hi, &lo);
+        (void)lo;
+        /* (alpha_q * |credit|) >> 64 == hi; hi <= 2^31 here. */
+        if (cr < 0) delta = -(int64_t)hi;
+        else        delta =  (int64_t)hi;
+    }
+
+    int64_t base = (int64_t)c->w[i] + delta;
+    if (base < 0) base = 0;                        /* max(0, ...) */
+
+    return mul128_shr32((uint64_t)base, c->cooldown[i]);
+}
+
+/* ------------------------------------------------------------------ *
+ * Fenwick tree over uint64 with wrap-around point updates
+ * ------------------------------------------------------------------ */
+static void fenwick_add(wccs_ctx *c, int32_t idx0, uint64_t delta)
+{
+    int32_t j = idx0 + 1;
+    while (j <= c->n) {
+        c->bit[j] += delta;                        /* unsigned wrap is defined */
+        j += j & (-j);
+    }
+}
+
+static void fenwick_set(wccs_ctx *c, int32_t i, uint64_t v)
+{
+    uint64_t delta = v - c->cur[i];
+    c->cur[i] = v;
+    c->total += delta;                            /* unsigned wrap is defined */
+    fenwick_add(c, i, delta);
+}
+
+static void fenwick_rebuild(wccs_ctx *c)
+{
+    int32_t i;
+    memset(c->bit, 0, (size_t)(c->n + 1) * sizeof(uint64_t));
+    c->total = 0;
+    for (i = 0; i < c->n; ++i) {
+        uint64_t v = calc_v(c, i);
+        int32_t b = i + 1;
+        int32_t parent;
+        c->cur[i] = v;
+        c->bit[b] += v;
+        c->total += v;
+        parent = b + (b & (-b));
+        if (parent <= c->n) c->bit[parent] += c->bit[b];
+    }
+}
+
+/* Smallest 0-based index whose cumulative sum is > r. */
+static int32_t fenwick_find_by_cumulative(const wccs_ctx *c, uint64_t r)
+{
+    int32_t idx = 0;
+    int32_t d = 1;
+    uint64_t acc = 0;
+    while (d <= c->n / 2) d <<= 1;               /* no int32 overflow */
+    for (; d != 0; d >>= 1) {
+        int32_t nb = idx + d;
+        if (nb <= c->n) {
+            uint64_t t = acc + c->bit[nb];
+            if (t <= r) { acc = t; idx = nb; }
+        }
+    }
+    return idx;   /* 0-based element index */
+}
+
+/* ------------------------------------------------------------------ *
+ * Unbiased bounded random (Lemire). No modulo on the random value.
+ * ------------------------------------------------------------------ */
+static uint64_t random_below(wccs_ctx *c, uint64_t n)
+{
+    uint64_t x = c->rng.next_u64(c->rng.ctx);
+    uint64_t hi, lo;
+    mul128(x, n, &hi, &lo);                        /* hi = (x*n)>>64, lo = low */
+    if (lo < n) {
+        uint64_t t = (uint64_t)(0 - n) % n;        /* 2^64 mod n */
+        while (lo < t) {
+            x = c->rng.next_u64(c->rng.ctx);
+            mul128(x, n, &hi, &lo);
+        }
+    }
+    return hi;
+}
+
+/* ------------------------------------------------------------------ *
+ * Credit rebuild: target_i = (w_i * step) / W_total
+ *                 credit_i = (target_i - actual_i) << 32   (Q32)
+ * ------------------------------------------------------------------ */
+static void rebuild_credit(wccs_ctx *c)
+{
+    int32_t i;
+    for (i = 0; i < c->n; ++i) {
+        uint64_t hi, lo;
+        uint64_t target, diff;
+        mul128(c->w[i], c->step, &hi, &lo);
+        target = div128_64(hi, lo, c->W_total, NULL);
+        diff = (target << 32) - (c->actual[i] << 32);
+        c->credit[i] = u64_to_i64(diff);
+    }
+    fenwick_rebuild(c);
+}
+
+/* ------------------------------------------------------------------ *
+ * Public API
+ * ------------------------------------------------------------------ */
+
+void wccs_free(wccs_ctx *c)
+{
+    if (!c) return;
+    free(c->w);
+    free(c->bit);
+    free(c->cur);
+    free(c->actual);
+    free(c->credit);
+    free(c->cooldown);
+    free(c->recent);
+    free(c);
+}
+
+static wccs_ctx *ctx_alloc(int32_t n, int32_t L)
+{
+    wccs_ctx *c = (wccs_ctx *)calloc(1, sizeof(wccs_ctx));
+    if (!c) return NULL;
+    c->w        = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    c->bit      = (uint64_t *)calloc((size_t)(n + 1), sizeof(uint64_t));
+    c->cur      = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    c->actual   = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    c->credit   = (int64_t  *)calloc((size_t)n, sizeof(int64_t));
+    c->cooldown = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    if (L > 0) c->recent = (int32_t *)calloc((size_t)L, sizeof(int32_t));
+    if (!c->w || !c->bit || !c->cur || !c->actual || !c->credit ||
+        !c->cooldown || (L > 0 && !c->recent)) {
+        wccs_free(c);
+        return NULL;
+    }
+    return c;
+}
+
+wccs_ctx* wccs_new(
+    int32_t n, const uint64_t *w,
+    int32_t L, uint64_t beta_q, uint64_t alpha_q,
+    int32_t R, uint64_t seed, uint64_t stream_id,
+    wccs_rng_t rng, int32_t *err)
+{
+    wccs_ctx *c = NULL;
+    uint64_t W = 0;
+    int32_t e = WCCS_OK;
+    int32_t i;
+
+    if (err) *err = WCCS_OK;
+
+    if (n <= 0 || !w || L < 0 || R < 1 ||
+        beta_q > ONE_Q32 || alpha_q > ONE_Q32 || !rng.next_u64) {
+        e = WCCS_E_INVAL;
+        goto fail;
+    }
+    for (i = 0; i < n; ++i) {
+        if (w[i] == 0) { e = WCCS_E_INVAL; goto fail; }
+        if (W > UINT64_MAX - w[i]) { e = WCCS_E_OVERFLOW; goto fail; }
+        W += w[i];
+    }
+
+    c = ctx_alloc(n, L);
+    if (!c) { e = WCCS_E_NOMEM; goto fail; }
+
+    c->n = n; c->L = L; c->R = R;
+    c->beta_q = beta_q; c->alpha_q = alpha_q;
+    c->seed = seed; c->stream_id = stream_id;
+    c->W_total = W;
+    c->rng = rng;
+    c->last_err = WCCS_OK;
+    memcpy(c->w, w, (size_t)n * sizeof(uint64_t));
+    for (i = 0; i < n; ++i) c->cooldown[i] = ONE_Q32;
+
+    fenwick_rebuild(c);
+    if (c->total == 0) { e = WCCS_E_EMPTY; goto fail; }
+
+    if (err) *err = WCCS_OK;
+    return c;
+
+fail:
+    if (c) wccs_free(c);
+    if (err) *err = e;
+    return NULL;
+}
+
+wccs_ctx* wccs_new_default(
+    int32_t n, const uint64_t *w,
+    int32_t L, uint64_t beta_q, uint64_t alpha_q,
+    int32_t R, uint64_t seed, uint64_t stream_id,
+    int32_t *err)
+{
+    wccs_rng_t r;
+    wccs_ctx *c;
+
+    /* Construction never consumes randomness, so we may safely patch the
+     * RNG context to point inside the freshly allocated context afterwards. */
+    r.ctx = NULL;
+    r.next_u64 = wccs_pcg64_next;
+    c = wccs_new(n, w, L, beta_q, alpha_q, R, seed, stream_id, r, err);
+    if (!c) return NULL;
+
+    wccs_pcg64_init(&c->pcg, seed, stream_id);
+    c->rng.ctx = &c->pcg;
+    return c;
+}
+
+int32_t wccs_sample(wccs_ctx *c, int32_t *err)
+{
+    int32_t e = WCCS_OK;
+    int32_t i = -1;
+    uint64_t r;
+
+    if (!c) {
+        if (err) *err = WCCS_E_NULL;
+        return -1;
+    }
+    c->last_err = WCCS_OK;
+
+    /* Degenerate case: every element is cooled down. Clear the cooldown
+     * queue, restore all cooldown factors and rebuild the Fenwick tree. */
+    if (c->total == 0) {
+        int32_t k;
+        for (k = 0; k < c->n; ++k) c->cooldown[k] = ONE_Q32;
+        c->recent_head = 0;
+        c->recent_count = 0;
+        fenwick_rebuild(c);
+        if (c->total == 0) { e = WCCS_E_EMPTY; goto out; }
+    }
+
+    r = random_below(c, c->total);
+    i = fenwick_find_by_cumulative(c, r);
+    if (i < 0 || i >= c->n) { e = WCCS_E_STATE; goto out; }
+
+    c->actual[i] += 1;
+    c->step += 1;
+
+    /* Cooldown window: keep the most recent L indices cooled. The window has
+     * capacity L; when full, the oldest slot is released before the new one
+     * is written. This yields L=1 => "no consecutive repeats" and
+     * L>=n + beta_q=0 + equal weights => random permutation each round,
+     * exactly as required by the degeneracy table in work.md section 1.6. */
+    if (c->L > 0) {
+        if (c->recent_count == c->L) {
+            int32_t j = c->recent[c->recent_head];  /* oldest when full */
+            c->recent_count--;
+            c->cooldown[j] = ONE_Q32;
+            fenwick_set(c, j, calc_v(c, j));
+        }
+        c->cooldown[i] = c->beta_q;
+        fenwick_set(c, i, calc_v(c, i));
+        c->recent[c->recent_head] = i;
+        c->recent_head = (c->recent_head + 1) % c->L;
+        c->recent_count++;
+    }
+
+    if (c->step % (uint64_t)c->R == 0) rebuild_credit(c);
+
+out:
+    c->last_err = e;
+    if (err) *err = e;
+    return (e == WCCS_OK) ? i : -1;
+}
+
+int32_t wccs_abi_version(void) { return WCCS_ABI_VERSION; }
+
+const char* wccs_error_string(int32_t err)
+{
+    switch (err) {
+        case WCCS_OK:         return "OK";
+        case WCCS_E_INVAL:    return "invalid argument";
+        case WCCS_E_NOMEM:    return "out of memory";
+        case WCCS_E_OVERFLOW: return "weight sum overflow";
+        case WCCS_E_EMPTY:    return "all dynamic weights are zero";
+        case WCCS_E_NULL:     return "null context";
+        case WCCS_E_STATE:    return "internal state error";
+        default:              return "unknown error";
+    }
+}
+
+uint64_t wccs_step(const wccs_ctx *c)  { return c ? c->step  : 0; }
+uint64_t wccs_total(const wccs_ctx *c) { return c ? c->total : 0; }
+int32_t  wccs_last_error(const wccs_ctx *c)
+{
+    return c ? c->last_err : WCCS_E_NULL;
+}

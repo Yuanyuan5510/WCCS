@@ -1,0 +1,144 @@
+name: CI
+
+# Four stages of work.md section 6:
+#   1. core build + C test matrix (all platforms)
+#   2. all language bindings + cross-language consistency
+#   3. WASM fallback build
+#   4. release packaging (manual trigger)
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- stage 1
+  core:
+    name: core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-2022]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DWCCS_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Test C core matrix + C++ binding
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Verify installed pkg-config / CMake package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # wccs.pc embeds CMAKE_INSTALL_PREFIX, so configure with the real
+          # destination prefix rather than overriding it at install time.
+          cmake -B build-pc -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX="$PWD/_install_pc" -DWCCS_BUILD_TESTS=OFF
+          cmake --build build-pc --parallel 4
+          cmake --install build-pc
+          PC=$(find _install_pc -name wccs.pc | head -1)
+          echo "pkg-config file: $PC"
+          PKG_CONFIG_PATH="$(dirname "$PC")" pkg-config --cflags --libs wccs
+          test -f _install_pc/lib/cmake/wccs/wccs-config.cmake
+
+  # ---------------------------------------------------------------- stage 2
+  bindings:
+    name: bindings (${{ matrix.os }})
+    needs: core
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-2022]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build C core (shared library for FFI bindings)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --parallel 4
+
+      - name: Rust unit tests
+        run: cargo test --manifest-path bindings/rust/Cargo.toml
+
+      - name: Python unit tests
+        run: python -m unittest discover -s bindings/python/tests -v
+        env:
+          PYTHONPATH: bindings/python
+
+      - name: Node dependencies
+        run: npm ci --prefix bindings/node
+
+      - name: Cross-language consistency (SHA-256 fixed vector)
+        run: python tests/run_cross_lang.py
+
+      - name: Node CJS + ESM loaders
+        run: npm test --prefix bindings/node
+
+  # ---------------------------------------------------------------- stage 3
+  wasm:
+    name: wasm fallback
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+      - name: Compile the C core to wasm32
+        run: bash bindings/node/wasm/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wccs-wasm
+          path: |
+            bindings/node/wasm/wccs.mjs
+            bindings/node/wasm/wccs.wasm
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- stage 4
+  package:
+    name: package (${{ matrix.os }})
+    needs: [core, bindings, wasm]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-2022]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + install C/C++ release artifacts
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DWCCS_BUILD_TESTS=OFF
+          cmake --build build --config Release --parallel 4
+          cmake --install build --prefix dist --config Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wccs-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: error
+
+# Publishing to PyPI / NuGet / npm / crates.io is a manual release step:
+#   PyPI      : maturin publish  (or `uv publish`) with a manylinux wheel
+#   NuGet     : dotnet nuget push, native libs under runtimes/{rid}/native/
+#   npm       : npm publish (root loader + platform optional packages)
+#   crates.io : cargo publish
+#   C/C++     : attach the `package` artifacts to a GitHub Release
+# All binding versions must resolve to the same WCCS_ABI_VERSION (section 6).

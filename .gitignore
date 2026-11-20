@@ -1,0 +1,49 @@
+# Build outputs
+build/
+build-*/
+cmake-build-*/
+out/
+_install/
+_install_pc/
+
+# C / C++
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# Rust
+target/
+
+# .NET
+bin/
+obj/
+*.user
+
+# Node
+node_modules/
+*.wasm
+bindings/node/wasm/wccs.mjs
+bindings/node/wasm/wccs.wasm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+venv/
+
+# Editors / OS
+.vs/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,31 @@
+{
+  "name": "wccs",
+  "version": "0.1.0",
+  "description": "WCCS (Weighted Credit-Cooldown Sampler) Node.js binding",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "main": "./index.cjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.cjs"
+    }
+  },
+  "files": ["index.cjs", "index.mjs", "index.d.ts", "wasm/"],
+  "scripts": {
+    "test": "node test/vector.cjs && node test/vector.mjs",
+    "test:cjs": "node test/vector.cjs",
+    "test:esm": "node test/vector.mjs"
+  },
+  "dependencies": {
+    "koffi": "^3.3.8"
+  },
+  "engines": { "node": ">=18" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Yuanyuan5510/WCCS.git"
+  },
+  "keywords": ["sampling", "weighted", "cooldown", "deterministic", "ffi", "wasm"]
+}

@@ -1,0 +1,20 @@
+[package]
+name = "wccs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "Apache-2.0"
+description = "Rust binding for WCCS (Weighted Credit-Cooldown Sampler) C ABI"
+repository = "https://github.com/Yuanyuan5510/WCCS"
+build = "build.rs"
+
+[lib]
+name = "wccs"
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1"
+
+[[example]]
+name = "vector"
+path = "examples/vector.rs"

@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/wccsTargets.cmake")
+
+# wccs::wccs        -> shared C ABI library
+# wccs::wccs_static -> static library (also exported as wccs::static in tree)
+check_required_components(wccs)
