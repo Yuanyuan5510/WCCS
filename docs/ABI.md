@@ -78,6 +78,15 @@ same `stream_id` scheme) or add external locking in the host application.
 
 ## Version lock
 
-All binding packages (`pyproject.toml`, `Cargo.toml`, `*.csproj`,
-`package.json`) are at `0.1.0` and depend on ABI 1. Any ABI bump requires a
-coordinated major-version bump across all six packages (§6).
+The root [`VERSION`](../VERSION) file is the single source of truth. All
+binding packages (`pyproject.toml`, `Cargo.toml`, `package.json`) are at
+`1.0.0` and target ABI 1; `CMakeLists.txt` reads `VERSION` directly.
+
+CI enforces the rule before building anything:
+
+- `VERSION` must equal the version in every package manifest;
+- on a tag, `v<tag>` must equal `VERSION`.
+
+A mismatch fails the `version gate` job, so no artifact and no release is
+produced. Any ABI bump requires a coordinated major-version bump here and in
+all six packages (§6).

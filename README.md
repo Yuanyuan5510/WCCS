@@ -225,26 +225,35 @@ bindings/python/tests`, `dotnet run --project bindings/csharp/Wccs.Tests`,
 
 ## CI & release
 
-`.github/workflows/ci.yml` implements the five stages of `work.md` §6:
+`.github/workflows/ci.yml` runs a version gate plus five stages:
 
+0. **version gate** — [`VERSION`](VERSION) is the single source of truth.
+   CI checks that `bindings/python/pyproject.toml`,
+   `bindings/rust/Cargo.toml` and `bindings/node/package.json` all match it.
+   On a tag it additionally requires `v<tag> == VERSION`; if they disagree the
+   job fails and **nothing is built or published**. (`CMakeLists.txt` reads
+   `VERSION` directly, so the C/C++ SDK cannot drift.)
 1. **core** — Ubuntu 22.04 / macOS 15 / Windows 2022, CMake + `ctest`
 2. **bindings** — same matrix, all six languages + `run_cross_lang.py`
 3. **wasm** — Emscripten build of the C core, uploaded as an artifact
-4. **package** — runs on every push to `main`, on `v*` tags and on manual
-   dispatch (PRs skip it) and builds:
+4. **package** — only on a matching `v*` tag or a manual run. Builds:
    - C/C++ SDK (`cmake --install` layout: lib, headers, `wccs.pc`, CMake config)
    - Python wheel with the native library bundled next to `wccs/__init__.py`
    - npm tarball with the native library bundled
    - C# assembly plus its native dependency
    - self-contained Rust crate (C source vendored under `vendor/`)
-5. **release** — on a `v*` tag, publishes every platform bundle and the WASM
-   output to a GitHub Release.
+5. **release** — on a matching `v*` tag, publishes every platform bundle and
+   the WASM output to a GitHub Release.
+
+A plain push to `main` stops after the tests, so day-to-day commits stay fast.
 
 Cut a release with:
 
 ```bash
+# 1. bump VERSION and the three package manifests to the same value
+# 2. commit, then tag with that exact version
 git tag -a v1.0.0 -m "WCCS 1.0.0 (C ABI 1)"
-git push origin v1.0.0
+git push origin main v1.0.0
 ```
 
 Uploading to PyPI / NuGet / npm / crates.io still needs registry tokens and is
@@ -253,6 +262,7 @@ a manual step; see [`docs/REVIEW_CHECKLIST.md`](docs/REVIEW_CHECKLIST.md).
 ## Repository layout
 
 ```
+VERSION                     single source of truth for the release version
 include/wccs.h              versioned C ABI
 src/wccs.c                  the only algorithm implementation
 CMakeLists.txt              core + C++ test + install/packaging

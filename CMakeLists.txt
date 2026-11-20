@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.15)
-project(wccs VERSION 1.0.0 LANGUAGES C CXX)
+
+# Single source of truth for the release version. CI checks that every
+# binding package and the release tag agree with this file.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" WCCS_VERSION)
+string(STRIP "${WCCS_VERSION}" WCCS_VERSION)
+
+project(wccs VERSION ${WCCS_VERSION} LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)

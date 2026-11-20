@@ -36,7 +36,8 @@ of them plus the WASM build to a GitHub Release.
 
 | Item | Status |
 |---|---|
-| GitHub Release with all platform bundles + WASM | automated on `v*` tag |
+| Version gate (`VERSION` == manifests == `v*` tag) | automated; mismatch fails the run before building |
+| GitHub Release with all platform bundles + WASM | automated on a matching `v*` tag |
 | `manylinux` wheel audit for PyPI upload | not done — the CI wheel is platform-labelled by directory, not audited |
 | NuGet RID packaging (`runtimes/{rid}/native/`) | not done — CI ships a zip instead of a RID package |
 | npm platform optional packages | not done — CI ships one tarball per platform |
