@@ -7,5 +7,26 @@
     <AssemblyName>Wccs</AssemblyName>
     <RootNamespace>Wccs</RootNamespace>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+
+    <PackageId>Wccs</PackageId>
+    <Description>WCCS (Weighted Credit-Cooldown Sampler): deterministic weighted sampling with short-term cooldown and long-term frequency correction. Thin .NET binding over the versioned C ABI; native libraries ship under runtimes/&lt;rid&gt;/native/.</Description>
+    <Authors>Yuanyuan5510</Authors>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/Yuanyuan5510/WCCS</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>sampling;weighted;cooldown;deterministic;native;reproducible</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../../../README.md" Pack="true" PackagePath="/" Visible="false" />
+  </ItemGroup>
+
+  <!-- The release job assembles native/&lt;rid&gt;/libwccs.* and passes the directory
+       as WccsNativeDir, so one nupkg carries every platform's native library. -->
+  <ItemGroup Condition="'$(WccsNativeDir)' != ''">
+    <None Include="$(WccsNativeDir)/**/*" Pack="true"
+          PackagePath="runtimes/%(RecursiveDir)native/%(Filename)%(Extension)"
+          Visible="false" />
+  </ItemGroup>
 </Project>

@@ -21,11 +21,36 @@ const ErrorCodes = Object.freeze({
   E_EMPTY: 4, E_NULL: 5, E_STATE: 6,
 });
 
+const PLATFORM_PACKAGES = {
+  'win32-x64': 'wccs-win32-x64',
+  'linux-x64': 'wccs-linux-x64-gnu',
+  'darwin-arm64': 'wccs-darwin-arm64',
+};
+
+// Release tarballs ship the native library in a platform-specific optional
+// package (npm discourages putting binaries in the root tarball).
+function resolvePlatformPackage() {
+  const pkg = PLATFORM_PACKAGES[`${process.platform}-${process.arch}`];
+  if (!pkg) return null;
+  try {
+    const dir = path.dirname(require.resolve(`${pkg}/package.json`));
+    for (const n of ['libwccs.dll', 'wccs.dll', 'libwccs.so', 'libwccs.dylib']) {
+      const p = path.join(dir, n);
+      if (fs.existsSync(p)) return p;
+    }
+  } catch (_) { /* optional dependency not installed */ }
+  return null;
+}
+
 function findLibrary() {
   if (process.env.WCCS_LIBRARY_PATH) return process.env.WCCS_LIBRARY_PATH;
+
+  const fromPackage = resolvePlatformPackage();
+  if (fromPackage) return fromPackage;
+
   const root = path.resolve(__dirname, '..', '..');
   const dirs = [
-    __dirname,                              // native lib bundled in the tarball
+    __dirname,                              // native lib next to index.cjs
     path.join(root, 'build'),
     path.join(root, 'build', 'Release'),
     path.join(root, 'build', 'Debug'),

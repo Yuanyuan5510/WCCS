@@ -17,11 +17,13 @@
     "index.cjs",
     "index.mjs",
     "index.d.ts",
-    "wasm/",
-    "*.dll",
-    "*.so",
-    "*.dylib"
+    "wasm/"
   ],
+  "optionalDependencies": {
+    "wccs-win32-x64": "1.0.0",
+    "wccs-linux-x64-gnu": "1.0.0",
+    "wccs-darwin-arm64": "1.0.0"
+  },
   "scripts": {
     "test": "node test/vector.cjs && node test/vector.mjs",
     "test:cjs": "node test/vector.cjs",
