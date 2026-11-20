@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wccs"
-version = "0.1.0"
+version = "1.0.0"
 description = "Python binding for WCCS (Weighted Credit-Cooldown Sampler)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -18,3 +18,8 @@ Repository = "https://github.com/Yuanyuan5510/WCCS"
 [tool.setuptools]
 package-dir = { "" = "." }
 packages = ["wccs"]
+
+# The release build copies the platform native library next to __init__.py so
+# the wheel is self-contained (see .github/workflows/ci.yml).
+[tool.setuptools.package-data]
+wccs = ["*.dll", "*.so", "*.dylib"]

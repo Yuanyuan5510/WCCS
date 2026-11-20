@@ -25,6 +25,7 @@ function findLibrary() {
   if (process.env.WCCS_LIBRARY_PATH) return process.env.WCCS_LIBRARY_PATH;
   const root = path.resolve(__dirname, '..', '..');
   const dirs = [
+    __dirname,                              // native lib bundled in the tarball
     path.join(root, 'build'),
     path.join(root, 'build', 'Release'),
     path.join(root, 'build', 'Debug'),

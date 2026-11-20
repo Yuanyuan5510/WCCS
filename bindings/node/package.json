@@ -1,6 +1,6 @@
 {
   "name": "wccs",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "WCCS (Weighted Credit-Cooldown Sampler) Node.js binding",
   "license": "Apache-2.0",
   "type": "commonjs",
@@ -13,7 +13,15 @@
       "require": "./index.cjs"
     }
   },
-  "files": ["index.cjs", "index.mjs", "index.d.ts", "wasm/"],
+  "files": [
+    "index.cjs",
+    "index.mjs",
+    "index.d.ts",
+    "wasm/",
+    "*.dll",
+    "*.so",
+    "*.dylib"
+  ],
   "scripts": {
     "test": "node test/vector.cjs && node test/vector.mjs",
     "test:cjs": "node test/vector.cjs",

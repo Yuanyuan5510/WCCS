@@ -1,13 +1,16 @@
 name: CI
 
-# Four stages of work.md section 6:
+# Five stages of work.md section 6:
 #   1. core build + C test matrix (all platforms)
 #   2. all language bindings + cross-language consistency
 #   3. WASM fallback build
-#   4. release packaging (manual trigger)
+#   4. release packaging: C/C++ SDK, Python wheel, npm tarball, C# DLL,
+#      Rust crate (each bundles or vendors the native library)
+#   5. GitHub Release, only on a v* tag
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -60,8 +63,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-14 was retired on 2026-11-02; macos-15 is the current
-        # GitHub-hosted arm64 image.
         os: [ubuntu-22.04, macos-15, windows-2022]
     steps:
       - uses: actions/checkout@v4
@@ -120,31 +121,117 @@ jobs:
   package:
     name: package (${{ matrix.os }})
     needs: [core, bindings, wasm]
-    if: github.event_name == 'workflow_dispatch'
+    # Runs on push to main, on a v* tag and on manual dispatch; skipped on PRs.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # macos-14 was retired on 2026-11-02; macos-15 is the current
-        # GitHub-hosted arm64 image.
         os: [ubuntu-22.04, macos-15, windows-2022]
     steps:
       - uses: actions/checkout@v4
-      - name: Build + install C/C++ release artifacts
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build + install C/C++ SDK
+        shell: bash
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DWCCS_BUILD_TESTS=OFF
-          cmake --build build --config Release --parallel 4
-          cmake --install build --prefix dist --config Release
+          cmake -B build-rel -DCMAKE_BUILD_TYPE=Release -DWCCS_BUILD_TESTS=OFF \
+                -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/dist/sdk"
+          cmake --build build-rel --config Release --parallel 4
+          cmake --install build-rel --config Release
+
+      - name: Locate the native library
+        shell: bash
+        run: |
+          LIB=$(find build-rel \( -name 'libwccs.dll' -o -name 'wccs.dll' \
+                 -o -name 'libwccs.so' -o -name 'libwccs.dylib' \) | head -1)
+          test -n "$LIB"
+          echo "native library: $LIB"
+          echo "WCCS_LIB=$LIB" >> "$GITHUB_ENV"
+
+      - name: Python wheel (native library bundled)
+        shell: bash
+        run: |
+          cp "$WCCS_LIB" bindings/python/wccs/
+          python -m pip install --upgrade build
+          python -m build --wheel --outdir dist/wheels bindings/python
+
+      - name: npm tarball (native library bundled)
+        shell: bash
+        run: |
+          mkdir -p dist/npm
+          cp "$WCCS_LIB" bindings/node/
+          npm pack ./bindings/node --pack-destination "$GITHUB_WORKSPACE/dist/npm"
+
+      - name: C# library + native dependency
+        shell: bash
+        run: |
+          dotnet build bindings/csharp/Wccs/Wccs.csproj -c Release -o dist/csharp
+          cp "$WCCS_LIB" dist/csharp/
+
+      - name: Rust crate (vendored C source, self-contained)
+        shell: bash
+        run: |
+          mkdir -p bindings/rust/vendor
+          cp src/wccs.c include/wccs.h bindings/rust/vendor/
+          cargo package --manifest-path bindings/rust/Cargo.toml \
+                --allow-dirty --no-verify
+          mkdir -p dist/rust
+          cp bindings/rust/target/package/*.crate dist/rust/
+
+      - name: Bundle platform artifacts
+        shell: bash
+        env:
+          OS_LABEL: ${{ matrix.os }}
+        run: |
+          python -c "import os, shutil; shutil.make_archive('wccs-' + os.environ['OS_LABEL'] + '-artifacts', 'zip', 'dist')"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: wccs-${{ matrix.os }}
-          path: dist/
+          name: wccs-dist-${{ matrix.os }}
+          path: wccs-${{ matrix.os }}-artifacts.zip
+          retention-days: 14
           if-no-files-found: error
 
-# Publishing to PyPI / NuGet / npm / crates.io is a manual release step:
-#   PyPI      : maturin publish  (or `uv publish`) with a manylinux wheel
-#   NuGet     : dotnet nuget push, native libs under runtimes/{rid}/native/
-#   npm       : npm publish (root loader + platform optional packages)
-#   crates.io : cargo publish
-#   C/C++     : attach the `package` artifacts to a GitHub Release
+  # ---------------------------------------------------------------- stage 5
+  release:
+    name: publish GitHub Release
+    needs: [package, wasm]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten release assets
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: WCCS ${{ github.ref_name }}
+          files: release/*
+          generate_release_notes: true
+
+# Publishing to the language registries is still a manual step and needs
+# repository secrets:
+#   PyPI      : upload dist/wheels/*.whl (build a manylinux/macosx/win wheel)
+#   NuGet     : dotnet nuget push with native libs under runtimes/{rid}/native/
+#   npm       : npm publish dist/npm/*.tgz
+#   crates.io : cargo publish dist/rust/*.crate
 # All binding versions must resolve to the same WCCS_ABI_VERSION (section 6).

@@ -47,12 +47,22 @@ def _library_candidates():
     env = os.environ.get("WCCS_LIBRARY_PATH")
     if env:
         yield Path(env)
-    # bindings/python/wccs/__init__.py -> repository root is parents[3]
-    root = Path(__file__).resolve().parents[3]
     names = ("libwccs.dll", "wccs.dll", "libwccs.so", "libwccs.dylib")
-    for d in (root / "build", root / "build" / "Release", root / "build" / "Debug", root):
-        for n in names:
-            yield d / n
+    here = Path(__file__).resolve().parent
+
+    # 1) native library bundled inside an installed wheel
+    for n in names:
+        yield here / n
+
+    # 2) repository build directory (source checkout)
+    parents = Path(__file__).resolve().parents
+    if len(parents) > 3:
+        root = parents[3]
+        for d in (root / "build", root / "build" / "Release",
+                  root / "build" / "Debug", root):
+            for n in names:
+                yield d / n
+
     found = ctypes.util.find_library("wccs")
     if found:
         yield Path(found)
