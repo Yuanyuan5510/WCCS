@@ -225,15 +225,30 @@ bindings/python/tests`, `dotnet run --project bindings/csharp/Wccs.Tests`,
 
 ## CI & release
 
-`.github/workflows/ci.yml` implements the four stages of `work.md` §6:
+`.github/workflows/ci.yml` implements the five stages of `work.md` §6:
 
-1. **core** — Ubuntu 22.04 / macOS 14 / Windows 2022, CMake + `ctest`
+1. **core** — Ubuntu 22.04 / macOS 15 / Windows 2022, CMake + `ctest`
 2. **bindings** — same matrix, all six languages + `run_cross_lang.py`
 3. **wasm** — Emscripten build of the C core, uploaded as an artifact
-4. **package** — platform C/C++ artifacts on `workflow_dispatch`
+4. **package** — runs on every push to `main`, on `v*` tags and on manual
+   dispatch (PRs skip it) and builds:
+   - C/C++ SDK (`cmake --install` layout: lib, headers, `wccs.pc`, CMake config)
+   - Python wheel with the native library bundled next to `wccs/__init__.py`
+   - npm tarball with the native library bundled
+   - C# assembly plus its native dependency
+   - self-contained Rust crate (C source vendored under `vendor/`)
+5. **release** — on a `v*` tag, publishes every platform bundle and the WASM
+   output to a GitHub Release.
 
-Publishing to PyPI / NuGet / npm / crates.io is a manual release step; see
-[`docs/REVIEW_CHECKLIST.md`](docs/REVIEW_CHECKLIST.md).
+Cut a release with:
+
+```bash
+git tag -a v1.0.0 -m "WCCS 1.0.0 (C ABI 1)"
+git push origin v1.0.0
+```
+
+Uploading to PyPI / NuGet / npm / crates.io still needs registry tokens and is
+a manual step; see [`docs/REVIEW_CHECKLIST.md`](docs/REVIEW_CHECKLIST.md).
 
 ## Repository layout
 

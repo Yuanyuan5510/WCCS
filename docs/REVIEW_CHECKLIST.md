@@ -27,12 +27,17 @@ Status as of this implementation. Re-run before every release.
       (`ctest`, 48 793 checks, 0 failures).
 - [x] Error codes and exception mappings are consistent across languages.
 
-## Outstanding release-stage items
+## Release pipeline status
 
-| Item | Owner task |
+The CI `package` job now produces, per platform: the C/C++ SDK, a Python wheel
+with the native library bundled, an npm tarball, the C# assembly with its
+native dependency, and a self-contained Rust crate. A `v*` tag publishes all
+of them plus the WASM build to a GitHub Release.
+
+| Item | Status |
 |---|---|
-| `manylinux` wheel audit for the native library | publish pipeline |
-| NuGet RID packaging (`runtimes/{rid}/native/`) | publish pipeline |
-| npm platform optional packages (currently one FFI package + WASM build) | publish pipeline |
-| crates.io / PyPI / npm / NuGet publication | manual, `workflow_dispatch` |
-| WASM artifact attached to GitHub Release | CI `wasm` job |
+| GitHub Release with all platform bundles + WASM | automated on `v*` tag |
+| `manylinux` wheel audit for PyPI upload | not done — the CI wheel is platform-labelled by directory, not audited |
+| NuGet RID packaging (`runtimes/{rid}/native/`) | not done — CI ships a zip instead of a RID package |
+| npm platform optional packages | not done — CI ships one tarball per platform |
+| crates.io / PyPI / npm / NuGet publication | manual, requires registry secrets |
