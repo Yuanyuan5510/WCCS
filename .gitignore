@@ -42,6 +42,9 @@ dist/
 .venv/
 venv/
 
+# Agent workspace data (local only, never published)
+.workbuddy/
+
 # Editors / OS
 .vs/
 .idea/
