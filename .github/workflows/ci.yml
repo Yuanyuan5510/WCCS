@@ -215,12 +215,28 @@ jobs:
           echo "native library: $LIB"
           echo "WCCS_LIB=$LIB" >> "$GITHUB_ENV"
 
-      - name: Python wheel (native library bundled)
+      - name: Python wheel (native library bundled, platform tagged)
         shell: bash
         run: |
           cp "$WCCS_LIB" bindings/python/wccs/
           python -m pip install --upgrade build
-          python -m build --wheel --outdir dist/wheels bindings/python
+          PLAT=$(python -c "import sysconfig;p=sysconfig.get_platform();print(p.replace('-','_').replace('.','_'))")
+          if [ "$RUNNER_OS" = "macOS" ]; then PLAT="macosx_11_0_arm64"; fi
+          echo "wheel platform: $PLAT"
+          python -m build --wheel --outdir dist/wheels-raw \
+            --config-setting="--build-option=--plat-name=$PLAT" bindings/python
+          mkdir -p dist/wheels
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # PyPI only accepts manylinux tags for Linux wheels.
+            python -m pip install --upgrade auditwheel
+            auditwheel repair dist/wheels-raw/*.whl -w dist/wheels
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            python -m pip install --upgrade delocate
+            delocate-wheel -w dist/wheels dist/wheels-raw/*.whl
+          else
+            cp dist/wheels-raw/*.whl dist/wheels/
+          fi
+          ls -l dist/wheels
 
       - name: npm tarball (native library bundled)
         shell: bash
@@ -283,6 +299,42 @@ jobs:
           name: WCCS ${{ github.ref_name }}
           files: release/*
           generate_release_notes: true
+
+  # ---------------------------------------------------------------- stage 6
+  publish-pypi:
+    name: publish to PyPI
+    needs: [package]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wccs-dist-*
+          path: bundles
+
+      - name: Collect platform wheels
+        run: |
+          mkdir -p dist unpack
+          find bundles -name '*.zip' -exec unzip -o -q {} -d unpack \;
+          find unpack -name '*.whl' -exec cp {} dist/ \;
+          echo "wheels to publish:"
+          ls -1 dist
+
+      - name: Publish to PyPI
+        if: env.PYPI_TOKEN != ''
+        uses: pypa/gh-action-pypi-publish@release/v1
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+          packages-dir: dist/
+          skip-existing: true
+
+      - name: Warn when the token is missing
+        if: env.PYPI_TOKEN == ''
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: echo "::warning::PYPI_TOKEN secret is not set; wheels were built but not uploaded."
 
 # Publishing to the language registries is still a manual step and needs
 # repository secrets:

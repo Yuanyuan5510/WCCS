@@ -38,7 +38,8 @@ of them plus the WASM build to a GitHub Release.
 |---|---|
 | Version gate (`VERSION` == manifests == `v*` tag) | automated; mismatch fails the run before building |
 | GitHub Release with all platform bundles + WASM | automated on a matching `v*` tag |
-| `manylinux` wheel audit for PyPI upload | not done — the CI wheel is platform-labelled by directory, not audited |
+| PyPI wheels (`win_amd64`, `macosx_11_0_arm64`, `manylinux` via `auditwheel`) | automated in the package job |
+| PyPI publication | automated on a matching `v*` tag when the `PYPI_TOKEN` secret is set (`skip-existing`, so re-runs are safe) |
 | NuGet RID packaging (`runtimes/{rid}/native/`) | not done — CI ships a zip instead of a RID package |
 | npm platform optional packages | not done — CI ships one tarball per platform |
-| crates.io / PyPI / npm / NuGet publication | manual, requires registry secrets |
+| crates.io / npm / NuGet publication | manual, requires registry secrets |

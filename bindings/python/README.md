@@ -11,11 +11,14 @@ the same seed produces the same sequence in every language (L2).
 ## Install
 
 ```bash
-pip install ./bindings/python
+pip install wccs                # from PyPI: platform wheel, native library included
+pip install ./bindings/python   # or from a source checkout
 ```
 
-The native library must be discoverable at runtime. Build it with CMake
-(`cmake -B build && cmake --build build`) or set `WCCS_LIBRARY_PATH`:
+Release wheels bundle the native library inside the `wccs` package, so nothing
+else is required. For a source checkout without a bundled library, build it
+with CMake (`cmake -B build && cmake --build build`) or point the loader at an
+existing build:
 
 ```bash
 export WCCS_LIBRARY_PATH=/path/to/libwccs.so   # or .dll / .dylib
