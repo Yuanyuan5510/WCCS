@@ -220,22 +220,20 @@ jobs:
         run: |
           cp "$WCCS_LIB" bindings/python/wccs/
           python -m pip install --upgrade build
-          PLAT=$(python -c "import sysconfig;p=sysconfig.get_platform();print(p.replace('-','_').replace('.','_'))")
-          if [ "$RUNNER_OS" = "macOS" ]; then PLAT="macosx_11_0_arm64"; fi
-          echo "wheel platform: $PLAT"
-          python -m build --wheel --outdir dist/wheels-raw \
-            --config-setting="--build-option=--plat-name=$PLAT" bindings/python
-          mkdir -p dist/wheels
           if [ "$RUNNER_OS" = "Linux" ]; then
-            # PyPI only accepts manylinux tags for Linux wheels.
-            python -m pip install --upgrade auditwheel
-            auditwheel repair dist/wheels-raw/*.whl -w dist/wheels
+            # PyPI rejects bare linux_x86_64 wheels. Tag with the glibc that
+            # this runner actually has (PEP 600). The tag states the real
+            # minimum glibc instead of over-claiming manylinux2014.
+            GLIBC=$(getconf GNU_LIBC_VERSION | awk '{print $2}' | tr '.' '_')
+            PLAT="manylinux_${GLIBC}_x86_64"
           elif [ "$RUNNER_OS" = "macOS" ]; then
-            python -m pip install --upgrade delocate
-            delocate-wheel -w dist/wheels dist/wheels-raw/*.whl
+            PLAT="macosx_11_0_arm64"
           else
-            cp dist/wheels-raw/*.whl dist/wheels/
+            PLAT=$(python -c "import sysconfig;p=sysconfig.get_platform();print(p.replace('-','_').replace('.','_'))")
           fi
+          echo "wheel platform: $PLAT"
+          python -m build --wheel --outdir dist/wheels \
+            --config-setting="--build-option=--plat-name=$PLAT" bindings/python
           ls -l dist/wheels
 
       - name: npm tarball (native library bundled)
