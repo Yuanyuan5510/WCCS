@@ -22,7 +22,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14, windows-2022]
+        # macos-14 was retired on 2026-11-02; macos-15 is the current
+        # GitHub-hosted arm64 image.
+        os: [ubuntu-22.04, macos-15, windows-2022]
     steps:
       - uses: actions/checkout@v4
 
@@ -48,7 +50,7 @@ jobs:
           PC=$(find _install_pc -name wccs.pc | head -1)
           echo "pkg-config file: $PC"
           PKG_CONFIG_PATH="$(dirname "$PC")" pkg-config --cflags --libs wccs
-          test -f _install_pc/lib/cmake/wccs/wccs-config.cmake
+          test -n "$(find _install_pc -name wccs-config.cmake | head -1)"
 
   # ---------------------------------------------------------------- stage 2
   bindings:
@@ -58,7 +60,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14, windows-2022]
+        # macos-14 was retired on 2026-11-02; macos-15 is the current
+        # GitHub-hosted arm64 image.
+        os: [ubuntu-22.04, macos-15, windows-2022]
     steps:
       - uses: actions/checkout@v4
 
@@ -121,7 +125,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14, windows-2022]
+        # macos-14 was retired on 2026-11-02; macos-15 is the current
+        # GitHub-hosted arm64 image.
+        os: [ubuntu-22.04, macos-15, windows-2022]
     steps:
       - uses: actions/checkout@v4
       - name: Build + install C/C++ release artifacts

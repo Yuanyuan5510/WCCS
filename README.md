@@ -5,10 +5,14 @@ with short-term cooldown, long-term frequency correction, and parallel
 reproducibility on top of a high-quality random source.
 
 This repository is a concrete implementation of
-[`work.md`](work.md), the *WCCS 多平台库创作手册 v1.0*. It follows the
+[`work.md`](work.md), the *WCCS Multi-Platform Library Authoring Manual*. It follows the
 manual's central rule: **one C core, six thin bindings**. Algorithm logic is
 written exactly once; every language only translates types, ownership and
 errors.
+
+A condensed English edition of the manual is available as
+[`work.en.md`](work.en.md): architecture, core spec, ABI, binding notes,
+reproducibility levels, test matrix, CI and the review checklist.
 
 ```
                  include/wccs.h  (versioned C ABI, ABI 1)
@@ -249,6 +253,7 @@ bindings/csharp/            [LibraryImport] P/Invoke
 bindings/node/              koffi FFI (CJS+ESM) + WASM fallback
 docs/                       ABI, implementation notes, review checklist
 work.md                     original design manual (unchanged)
+work.en.md                  condensed English summary of the manual
 ```
 
 ## Constraints

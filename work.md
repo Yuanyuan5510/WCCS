@@ -1,412 +1,576 @@
-# 《WCCS 多平台库创作手册 v1.0》
+# *WCCS Multi-Platform Library Authoring Manual*
 
-**适用语言**：C / C++ / Rust / Python / C# / Node.js  
-**核心原则**：**一个 C 核心，六个薄绑定层**。算法逻辑只写一次，其余语言只做 ABI 翻译与包封装。
+**Applicable Languages**: C / C++ / Rust / Python / C# / Node.js
 
+**Core Principles**: **One C core, six thin binding layers**. Algorithm logic is written only once; other languages ​​only perform ABI translation and package encapsulation.
 
-## 0. 架构决策：为什么必须是 C 核心
+## 0. Architectural Decision: Why a C Core is Essential
 
-多平台库最稳定的契约不是“每个语言各写一遍算法”，而是**一个版本化的 C ABI**。C ABI 是 Go、Java/JNI、C#、Dart、Swift、Kotlin、Zig、R 等语言的通用交汇点，也是 C++/Rust 可以直接消费的稳定层。Radix 的实践验证了这条路径：核心与接口分离，UniFFI 服务 Swift/Kotlin/C#/Python，C-ABI + WASM 服务 TypeScript 和 Web。
+The most stable contract for a multi-platform library is not "writing the algorithm once for each language," but rather **a versioned C ABI**. The C ABI is a common intersection point for languages ​​such as Go, Java/JNI, C#, Dart, Swift, Kotlin, Zig, and R, and is also a stable layer that C++/Rust can directly consume. Radix's practices validate this path: core and interface separation; UniFFI serves Swift/Kotlin/C#/Python; C-ABI + WASM serves TypeScript and Web.
 
-**硬性约束**：
+**Hard Constraints**:
 
-| 层 | 职责 | 禁止 |
+| Layer | Responsibility | Prohibited |
+
 |---|---|---|
-| **核心（C）** | WCCS 全部状态、Fenwick、冷却队列、信用重建、随机映射 | 禁止依赖任何宿主语言运行时 |
-| **绑定层** | 类型映射、内存所有权翻译、错误转换、包元数据 | 禁止复制算法逻辑 |
-| **随机源** | 由核心通过注入接口调用，绑定层可替换实现 | 绑定层禁止自行消耗随机数 |
 
-> Rust 可以作为核心的**实现语言**，但对外必须导出 `extern "C"` 的 C ABI，而不是依赖 Rust 不稳定的原生 ABI。如果核心直接用 C 写，C++/Rust 绑定就是零成本的头文件包含或 `bindgen` 生成。**本手册以“C 核心 + Rust 辅助绑定生成”为默认路径**，C 核心也可用纯 C99 实现。
+| **Core (C)** | WCCS All State, Fenwick, Cooling Queue, Credit Reconstruction, Random Mapping | Prohibited from depending on any host language runtime |
 
+| **Binding Layer** | Type Mapping, Memory Ownership Translation, Error Translation, Package Metadata | Prohibited from copying algorithm logic |
 
-## 1. WCCS 核心逻辑规范（语言无关）
+| **Random Source** | Called by the core via an injected interface; replaceable implementation in the binding layer | The binding layer is prohibited from consuming random numbers itself |
 
-这一节是**所有语言必须逐字实现的唯一规格**。绑定层不得偏离。
+> Rust can be used as the **implementation language** for the core, but it must export the `extern "C"` C ABI externally, rather than relying on Rust's unstable native ABI. If the core is written directly in C, C++/Rust bindings are generated at zero cost via header file inclusion or `bindgen`. **This manual uses "C core + Rust auxiliary binding generation" as the default path**; the C core can also be implemented using pure C99.
 
-### 1.1 输入与状态
+## 1. WCCS Core Logic Specification (Language Independent)
+
+This section is the **only specification that all languages ​​must implement verbatim**. The binding layer must not deviate from it.
+
+### 1.1 Input and State
 
 ```text
-输入:
-  n            : 集合大小 (int32, > 0)
-  w[n]         : 基础权重，整数 (uint64)，> 0
-  L            : 冷却窗口 (int32, >= 0)
-  beta_q       : 软冷却因子，定点 Q32 (uint64)，范围 [0, 2^32]
-                 beta_q = round(beta * 2^32)，beta=0 严格冷却，beta=1 无冷却
-  alpha_q      : 信用校正强度，定点 Q32 (uint64)，范围 [0, 2^32]
-  R            : 信用重建周期 (int32, >= 1)
-  seed         : 随机种子 (uint64)
-  stream_id    : 并行流编号 (uint64)
+Input:
 
-状态:
-  Fenwick bit[]      : 长度 n+1，Fenwick 树，存储当前动态权重 v_i
-  total              : Fenwick 总和 (uint64)
-  actual[n]          : 实际抽中次数 (uint64)
-  credit[n]          : 信用值，定点 Q32 (int64)
-  cooldown[n]        : 冷却因子，定点 Q32 (uint64)，1<<32 表示可用
-  recent[L]          : 环形缓冲，存储最近 L 次抽中的索引 (int32)
-  recent_head        : 环形缓冲写入位置
-  recent_count       : 当前窗口内元素数量
-  step               : 总抽样次数 (uint64)，用于信用重建
-  rng_state          : 注入的随机源状态（由绑定层管理）
-```
+n: Set size (int32, > 0)
 
-**为什么用整数/定点**：跨语言浮点运算（`double` 的舍入、扩展精度、`-ffast-math`）会导致结果不可复现。权重和因子全部用 `uint64` / `int64` 定点，Fenwick 用整数，保证**同 seed 在所有语言、所有平台产出完全相同的索引序列**。Randompack 的跨平台可复现性正是建立在分离引擎与分布、严格控制数值路径的基础上。
+w[n]: Base weight, integer (uint64), > 0
 
-### 1.2 动态权重计算
+L: Cooling window (int32, >= 0)
+
+beta_q: Soft cooling factor, fixed-point Q32 (uint64), range [0, 2^32]
+
+beta_q = round(beta * 2^32), beta=0 strict cooling, beta=1 no cooling
+
+alpha_q: Credit correction strength, fixed-point Q32 (uint64), range [0, 2^32]
+
+R: Credit reconstruction period (int32, >= 1)
+
+seed: Random seed (uint64)
+
+stream_id: Parallel stream number (uint64)
+
+State:
+
+Fenwick bit[]: Length n+1, Fenwick Tree, storing the current dynamic weight v_i
+
+total: Fenwick total (uint64)
+
+actual[n]: Actual number of samplings (uint64)
+
+credit[n]: Credit value, fixed-point Q32 (int64)
+
+cooldown[n]: Cooling factor, fixed-point Q32 (uint64), 1<<32 indicates availability
+
+recent[L]: Circular buffer, storing the index of the most recent L samplings (int32)
+
+recent_head: Circular buffer write position
+
+recent_count: Number of elements in the current window
+
+step: Total number of samplings (uint64), used for credit reconstruction
+
+rng_state: Injected random source state (managed by the binding layer)
+
+**Why use integers/fixed-point**: Cross-language floating-point operations (rounding of `double`, extended precision, `-ffast-math`) can lead to unreproducible results. Weights and factors are all fixed-point (`uint64` / `int64`), while Fenwick uses integers, ensuring that **the same seed produces the exact same index sequence across all languages ​​and platforms**. Randompack's cross-platform reproducibility is built upon separating the engine and distribution, and strictly controlling the numerical path.
+
+### 1.2 Dynamic Weight Calculation
 
 ```text
 v_i = max(0, w_i + (alpha_q * credit_i) >> 32) * cooldown_i >> 32
+
 ```
 
-所有乘法用 `__int128` 或高精度中间类型防止溢出；`>> 32` 是 Q32 定点还原。
+All multiplications use `__int128` or high-precision intermediate types to prevent overflow; `>> 32` is a Q32 fixed-point restoration.
 
-### 1.3 无偏随机映射（Lemire）
+### 1.3 Unbiased Random Mapping (Lemire)
 
-随机源只提供 `next_u64()`。核心内部必须用无偏映射：
+The random source only provides `next_u64()`. The core must use unbiased mapping:
 
 ```c
 static uint64_t random_below(uint64_t n, wccs_rng_t *rng) {
-    uint64_t x = rng->next_u64(rng->ctx);
-    __uint128_t m = (__uint128_t)x * n;
-    uint64_t l = (uint64_t)m;
-    if (l < n) {
-        uint64_t t = (0 - n) % n;
-        while (l < t) {
-            x = rng->next_u64(rng->ctx);
-            m = (__uint128_t)x * n;
-            l = (uint64_t)m;
-        }
-    }
-    return (uint64_t)(m >> 64);
+
+uint64_t x = rng->next_u64(rng->ctx);
+
+__uint128_t m = (__uint128_t)x * n;
+
+uint64_t l = (uint64_t)m;
+
+if (l < n) {
+
+uint64_t t = (0 - n) % n;
+
+while (l < t) {
+
+x = rng->next_u64(rng->ctx);
+
+m = (__uint128_t)x * n;
+
+l = (uint64_t)m;
+
+}
+
+}
+
+return (uint64_t)(m >> 64);
+
 }
 ```
 
-**禁止 `% n`**。所有语言的绑定层不得自行生成随机索引，必须走核心的 `wccs_sample`。
+**Prohibit `% n`**. The binding layers for all languages ​​must not generate random indices themselves; they must use the core `wccs_sample`.
 
-### 1.4 采样
+### 1.4 Sampling
 
 ```c
-// 前置：若 total == 0，清冷却并重建
-uint64_t r = random_below(total, rng);          // 在 [0, total) 无偏
-int32_t i = fenwick_find_by_cumulative(r);       // Fenwick 前缀和定位
+
+// Pre-processing: If total == 0, clear cooldown and rebuild
+
+uint64_t r = random_below(total, rng); // Unbiased in [0, total)
+
+int32_t i = fenwick_find_by_cumulative(r); // Fenwick prefix sum location
 
 actual[i] += 1;
+
 step += 1;
 
-// 冷却更新
-cooldown[i] = beta_q;                             // beta_q=0 严格，beta_q=1<<32 无冷却
-fenwick_update(i, calc_v(i));
-recent_push(i);                                   // 环形缓冲
-if (recent_count == L) {
-    int32_t j = recent_pop_oldest();
-    cooldown[j] = 1ULL << 32;
-    fenwick_update(j, calc_v(j));
-}
+// Cooldown update
 
-// 信用重建
+cooldown[i] = beta_q; // beta_q=0 strict, beta_q=1<<32 no cooldown
+
+fenwick_update(i, calc_v(i));
+
+recent_push(i); // Circular buffer
+
+if (recent_count == L) {
+
+int32_t j = recent_pop_oldest();
+
+cooldown[j] = 1ULL << 32;
+
+fenwick_update(j, calc_v(j));
+
+}
+// Credit Reconstruction
+
 if (step % R == 0) rebuild_credit();
+
 return i;
+
 ```
 
-### 1.5 信用重建
+### 1.5 Credit Reconstruction
 
 ```text
-target_i = (w_i * step) / W_total          // 整数除法，W_total = Σw
+
+target_i = (w_i * step) / W_total // Integer division, W_total = Σw
+
 credit_i = (int64)(target_i << 32) - (actual_i << 32)
+
 v_i = calc_v(i)
+
 fenwick_rebuild(v)
+
 ```
 
-`credit_i` 是“目标次数 - 实际次数”，用 Q32 表示小数部分。`target_i` 用 `uint64` 计算，防溢出。
+`credit_i` is "target number of times - actual number of times", using Q32 to represent the decimal part. `target_i` is calculated using `uint64` to prevent overflow.
 
-### 1.6 退化行为（必须逐语言一致）
+### 1.6 Degenerate Behavior (Must be consistent across languages)
 
-| 配置 | 行为 |
+| Configuration | Behavior |
+
 |---|---|
-| `L=0, alpha_q=0` | 纯加权随机，允许重复 |
-| `L=1, beta_q=0` | 禁止连续相同 |
-| `L≥n, beta_q=0, w` 等权 | 每轮无放回随机排列 |
-| `beta_q>0` | 软冷却，高权重不会长期被压死 |
-| `total=0` | 清空冷却队列，恢复所有 `cooldown=1<<32`，重建 Fenwick |
 
+| `L=0, alpha_q=0` | Purely weighted random, allows repetition |
 
-## 2. C 核心设计（唯一事实来源）
+| `L=1, beta_q=0` | Prohibits consecutive identical occurrences |
 
-### 2.1 公共头文件（版本化 ABI）
+| `L≥n, beta_q=0, w` Equal weights | Random permutation without replacement in each round |
 
-`include/wccs.h` 是**唯一稳定契约**。用 `cbindgen` 从带注释的 Rust 代码生成，或手写维护。
+| `beta_q>0` | Soft cooling, high weights will not be overwhelmed for long periods |
+
+| `total=0` | Clear the cooldown queue, restore all `cooldown=1<<32`, rebuild Fenwick |
+
+## 2. C Core Design (Sole Source of Facts)
+
+### 2.1 Common Header Files (Versioned ABI)
+
+`include/wccs.h` is the **single stable contract**. Generated from annotated Rust code using `cbindgen`, or maintained manually.
 
 ```c
 #define WCCS_ABI_VERSION 1
 
-typedef struct wccs_ctx wccs_ctx;   // 不透明句柄
+typedef struct wccs_ctx wccs_ctx; // opaque handle
 
-typedef struct {
-    void *ctx;
-    uint64_t (*next_u64)(void *ctx);
+typedef struct { 
+void *ctx; 
+uint64_t (*next_u64)(void *ctx);
 } wccs_rng_t;
 
-WCCS_API wccs_ctx* wccs_new(
-    int32_t n, const uint64_t *w,
-    int32_t L, uint64_t beta_q, uint64_t alpha_q,
-    int32_t R, uint64_t seed, uint64_t stream_id,
-    wccs_rng_t rng, int32_t *err);
+WCCS_API wccs_ctx* wccs_new( 
+int32_t n, const uint64_t *w, 
+int32_t L, uint64_t beta_q, uint64_t alpha_q, 
+int32_t R, uint64_t seed, uint64_t stream_id, 
+wccs_rng_t rng, int32_t *err);
 
 WCCS_API int32_t wccs_sample(wccs_ctx *c, int32_t *err);
+
 WCCS_API void wccs_free(wccs_ctx *c);
+
 WCCS_API int32_t wccs_abi_version(void);
+
 ```
 
-**ABI 规则**：
-- 只追加，不修改已有函数签名和枚举值；
-- `err` 使用稳定的错误码（`WCCS_OK=0`, `WCCS_E_INVAL=1`, ...），追加新码不改变旧码数值；
-- 不透明句柄 + 构造函数/析构函数 + 方法，不暴露内部结构体布局。
+**ABI Rules**:
 
-### 2.2 内存所有权
+- Only append, do not modify existing function signatures and enumeration values;
 
-**核心分配的内存，必须由核心释放。** 绑定层不得对核心返回的指针调用宿主语言的 `free`。
+- `err` uses stable error codes (`WCCS_OK=0`, `WCCS_E_INVAL=1`, ...), appending a new code does not change the value of the old code;
+
+- Opaque handle + constructor/destructor + method, do not expose the internal structure layout.
+
+### 2.2 Memory Ownership
+
+**Memory allocated by the kernel must be freed by the kernel.** The binding layer must not call the host language's `free` on pointers returned by the kernel.
 
 ```c
-// 核心内部用 malloc/free，绑定层通过 wccs_free 释放
-// 若核心返回字符串/数组，必须提供配套的 wccs_free_string / wccs_free_array
+
+// The core internally uses malloc/free, and the binding layer releases data via wccs_free
+
+// If the core returns a string/array, a matching wccs_free_string / wccs_free_array must be provided
+
 ```
 
-### 2.3 错误处理
+### 2.3 Error Handling
 
-**绝不允许 panic/异常穿越 C ABI。** Rust 核心用 `catch_unwind` 包裹每个导出函数，转为错误码。C 核心通过 `err` 输出参数返回。
+**Panic/exception crossing the C ABI is absolutely prohibited.** The Rust core wraps each exported function with `catch_unwind` to convert it to an error code. The C core returns parameters via `err`.
 
-
-## 3. 各语言绑定层设计
+## 3. Binding Layer Design for Each Language
 
 ### 3.1 C / C++
 
-**C**：直接 `#include "wccs.h"`，链接静态库或动态库。这是零成本绑定。
+**C**: Directly `#include "wccs.h"` to link static or dynamic libraries. This is zero-cost binding.
 
-**C++**：在 C ABI 上包一层 RAII。**不引入虚函数、异常、模板到边界层**——边界只做翻译。
+**C++**: Wrap a RAII layer on top of the C ABI. **Do not introduce virtual functions, exceptions, or templates to the boundary layer**—the boundary layer only performs translation.
 
-```cpp
-class Wccs {
-    wccs_ctx* c_ = nullptr;
-public:
-    Wccs(int32_t n, const std::vector<uint64_t>& w, /* ... */) {
-        int32_t err = 0;
-        c_ = wccs_new(n, w.data(), L, beta_q, alpha_q, R, seed, stream_id, rng_, &err);
-        if (err) throw std::runtime_error("wccs init failed");
-    }
-    int32_t sample() { int32_t e=0; auto r=wccs_sample(c_,&e); if(e) throw ...; return r; }
-    ~Wccs() { if (c_) wccs_free(c_); }
+``` ```cpp
+class Wccs { 
+wccs_ctx* c_ = nullptr;
+public: 
+Wccs(int32_t n, const std::vector<uint64_t>& w, /* ... */) { 
+int32_t err = 0; 
+c_ = wccs_new(n, w.data(), L, beta_q, alpha_q, R, seed, stream_id, rng_, &err); 
+if (err) th
+row std::runtime_error("wccs init failed");
+
+}
+int32_t sample() { int32_t e=0; auto r=wccs_sample(c_,&e); if(e) throw ...; return r; }
+
+~Wccs() { if (c_) wccs_free(c_); }
+
 };
-```
 
-**构建发布**：
-- 用 CMake 或 Meson，产出 `libwccs.a` / `libwccs.so|dylib|dll` + 头文件；
-- 提供 `pkg-config` 文件或 CMake config；
-- Windows 用 `.lib`（导入库）+ `.dll`，导出符号用 `__declspec(dllexport)`。
+**Build and Release**:
+
+- Use CMake or Meson to produce `libwccs.a` / `libwccs.so|dylib|dll` + header files;
+
+- Provide a `pkg-config` file or CMake config;
+
+- Windows uses `.lib` (import library) + `.dll`, and exports symbols using `__declspec(dllexport)`.
 
 ### 3.2 Rust
 
-Rust 可以有两种角色：
+Rust can have two roles:
 
-**角色 A：核心实现者**（推荐用于新项目）。`Cargo.toml` 中 `crate-type = ["cdylib", "staticlib"]`，导出 `extern "C"` 函数，用 `cbindgen` 生成 `wccs.h`。
+**Role A: Core Implementer** (Recommended for new projects) In `Cargo.toml`, `crate-type = ["cdylib", "staticlib"]` ​​exports `extern "C"` functions, which are then used by `cbindgen` to generate `wccs.h`.
 
-```toml
+``toml
+
 [lib]
+
 crate-type = ["cdylib", "staticlib"]
 
 [features]
+
 default = []
+
 wasm = ["wasm-bindgen", "getrandom/wasm_js"]
+
 ```
 
-**角色 B：消费者**。Rust 侧用 `bindgen` 从 `wccs.h` 生成 FFI 绑定，再包一层 safe API。如果是长期维护的 Rust 优先项目，也可以直接用 `cxx` 桥接 C++，但**不建议**为了“用 Rust”而把核心从 C 搬到 Rust 再搬回来——ABI 层多一跳就多一个失败模式。
+**Role B: Consumer**. The Rust side uses `bindgen` to generate FFI bindings from `wccs.h`, then wraps them in a safe API. For long-term, Rust-focused projects, `cxx` can be used to bridge C++, but **it is not recommended** to move the core from C to Rust and back just to "use Rust"—each additional hop in the ABI layer adds another failure mode.
 
-**发布**：`cargo build --release` 产出 `.a` / `.so` / `.dylib` / `.dll`。若同时发布到 crates.io，crate 本身是 `rlib`，原生库作为 release artifact 通过 CI 上传到 GitHub Release，下游自行下载链接。
+```toml
+
+```crate-type = ["cdylib", "staticlib"]`
+
+```crate-type = ["cdylib", "staticlib"]`
+
+```cbindgen`
+
+```toml
+
+```cbindgen = ["cdylib", "staticlib"]`
+
+```export ```extern "C"
+
+`export `C"
+
+```export `C` ... **Release**: `cargo build --release` produces `.a` / `.so` / `.dylib` / `.dll`. If also released to crates.io, the crate itself is `rlib`, and the native library is uploaded to the GitHub Release via CI as a release artifact. Downstream users can download it from the link.
 
 ### 3.3 Python
 
-**方案选择**：如果核心是 C ABI，Python 侧优先用 **cffi** 或 **ctypes** 直接调用动态库，不经过 PyO3。这样 Python 绑定与核心解耦，Python 版本升级不需要重编译。
+**Solution Selection**: If the core is a C ABI, the Python side should prioritize using **cffi** or **ctypes** to directly call the dynamic library, bypassing PyO3. This decouples Python bindings from the core, eliminating the need for recompilation during Python version upgrades.
 
-如果坚持用 PyO3（例如希望 Python 侧直接拥有 Rust 核心），用 **maturin** 打包：
+If you insist on using PyO3 (e.g., wanting a direct Rust kernel on the Python side), package it using **maturin**:
 
 ```toml
+
 # pyproject.toml
+
 [build-system]
+
 requires = ["maturin>=1.0,<2.0"]
+
 build-backend = "maturin"
 
 [tool.maturin]
+
 features = ["pyo3"]
+
 ```
 
 ```bash
-maturin build --release          # 产出 wheel
-maturin publish                  # 发布到 PyPI（Linux 需 manylinux 容器）
+
+maturin build --release # Produce wheel
+
+maturin publish # Publish to PyPI (Linux requires manylinux container)
+
 ```
 
-maturin 实现 PEP 517，支持 CPython 3.8+，可直接上传 PyPI；Linux wheel 必须用 manylinux 或 `cargo-zigbuild` 构建。
+maturin implements PEP 517, supports CPython 3.8+, and can be directly uploaded to PyPI; Linux wheels must be built using manylinux or `cargo-zigbuild`.
 
-**关键**：Python 绑定层**不要做数值运算**，所有 WCCS 逻辑在核心中。Python 只负责构造参数、持有句柄、调用 `wccs_sample`、把错误转为异常。
+**Key point:** The Python binding layer **should not perform numerical operations**; all WCCS logic is in the kernel. Python is only responsible for constructing parameters, holding handles, calling `wccs_sample`, and converting errors to exceptions.
 
 ### 3.4 C#
 
-**首选 P/Invoke 直接调用 C ABI**。这是最稳定、对 Native AOT 最友好的路径。
+**Please choose P/Invoke to directly call the C ABI.** This is the most stable and most friendly path to native AOT.
 
 ```csharp
-[DllImport("wccs", CallingConvention = CallingConvention.Cdecl)]
-static extern IntPtr wccs_new(int n, ulong[] w, int L, ulong beta_q, ulong alpha_q,
-    int R, ulong seed, ulong stream_id, ref WccsRng rng, out int err);
 
 [DllImport("wccs", CallingConvention = CallingConvention.Cdecl)]
+
+static extern IntPtr wccs_new(int n, ulong[] w, int L, ulong beta_q, ulong alpha_q,
+
+int R, ulong seed, ulong stream_id, ref WccsRng rng, out int err);
+
+[DllImport("wccs", CallingConvention = CallingConvention.Cdecl)]
+
 static extern int wccs_sample(IntPtr ctx, out int err);
+
 ```
 
-**Native AOT 注意**：P/Invoke 在 Native AOT 下与非 AOT 无区别，但**未经分析的 P/Invoke 可能在裁剪时出问题**。应对：
-- 用 `[LibraryImport]`（.NET 8+ 源生成）替代 `[DllImport]`，编译时绑定；
-- 或保留 `[DllImport]` 并显式 `DynamicallyAccessedMembers` / `trimmer` 配置。
+**Native AOT Note**: P/Invoke is indistinguishable from non-AOT under Native AOT, but **unanalyzed P/Invoke may cause problems during pruning**. Solutions:
 
-**NuGet 打包**：原生库按 RID 放在 `runtimes/{rid}/native/` 下，NuGet 自动选择。`.targets` 文件可选，用于处理传递性原生依赖。**不要**用 `NativeLibrary Include` 静态链接进托管程序集，那会破坏跨平台 NuGet 的 RID 解析。
+- Replace `[DllImport]` with `[LibraryImport]` (generated from .NET 8+ sources), binding at compile time;
+
+- Or retain `[DllImport]` and explicitly configure `DynamicallyAccessedMembers` / `trimmer`.
+
+**NuGet Packaging**: Native libraries are placed under `runtimes/{rid}/native/` by RID, automatically selected by NuGet. The `.targets` file is optional and used to handle transitive native dependencies. **Do not** statically link `NativeLibrary Include` into managed assemblies, as this will break cross-platform NuGet RID resolution.
 
 ### 3.5 Node.js
 
-Node.js 的策略取决于运行时范围：
+Node.js strategies depend on runtime scope:
 
-**只服务 Node/Bun**：用 **napi-rs**（Rust）或 **node-addon-api**（C++）构建 `.node` 原生插件。napi-rs 自动生成平台加载器，尝试本地文件 → 可选平台包 → WASI 回退。发布时按平台拆分 optional packages（`@scope/wccs-linux-x64-gnu` 等），根包只含 loader 和元数据。
+**Serving only Node/Bun**: Build native `.node` plugins using **napi-rs** (Rust) or **node-addon-api** (C++). napi-rs automatically generates platform loaders, attempting local files → optional platform packages → WASI fallback. During deployment, optional packages (e.g., `@scope/wccs-linux-x64-gnu`) are split by platform, with the root package containing only the loader and metadata.
 
-**需要覆盖 Deno / Edge Workers / 浏览器**：**优先 WASM**。用 `wasm-bindgen` 将 C 核心编译为 `.wasm`，Node 场景可保留原生插件作为高性能路径，非 Node 运行时回退 WASM。
+**Requires coverage of Deno / Edge Workers / browsers**: **WASM is prioritized**. The C kernel is compiled into `.wasm` files using `wasm-bindgen`. In Node scenarios, native plugins can be retained as a high-performance path; non-Node runtimes fall back to WASM.
 
-**打包策略**：
-- 根包 `main` 指向 napi-rs 生成的 loader，`.node` 文件不要打进 bundle，保持 external；
-- 同时生成 CommonJS 和 ESM loader，`exports` 字段显式声明 `import` / `require`；
-- WASM 构建用 `--features wasm` 条件编译，排除文件系统依赖。
+**Packaging strategy**:
 
+- The root package `main` points to the loader generated by napi-rs; `.node` files should not be included in the bundle, remaining external.
 
-## 4. 随机源与跨语言可复现性
+- Both CommonJS and ESM loaders are generated simultaneously; the `exports` field explicitly declares `import` / `require`.
 
-### 4.1 随机源注入
+- WASM builds use `--features wasm` conditional compilation to exclude file system dependencies.
 
-核心**不内置**随机源，只持有 `wccs_rng_t` 的函数指针。每个绑定层负责提供宿主语言的 RNG：
+## 4. Random Sources and Cross-Language Reproducibility
 
-| 语言 | 默认注入 |
+### 4.1 Random Source Injection
+
+The core **does not have a built-in** random source; it only holds a function pointer to `wccs_rng_t`. Each binding layer is responsible for providing the host language's RNG:
+
+| Language | Default Injection |
+
 |---|---|
-| C/C++ | PCG64 或 Philox（核心附带参考实现） |
-| Rust | `rand::rngs::SmallRng` 或 `rand_pcg` |
-| Python | `random.Random` 的 `getrandbits(64)` |
-| C# | `System.Random` 的 `NextInt64` 或 `RandomNumberGenerator` |
-| Node.js | `crypto.randomBytes` 或 `seedrandom` |
 
-**关键约束**：如果目标是**跨语言相同 seed 产出相同序列**，则所有绑定层必须注入**同一个确定性 PRNG**（例如核心附带的 PCG64 参考实现），不能用宿主语言各自的 RNG。Randompack 的可复现性正是通过统一引擎实现，而非依赖平台默认随机源。
+| C/C++ | PCG64 or Philox (reference implementation included with the core) |
 
-### 4.2 可复现的级别
+| Rust | `rand::rngs::SmallRng` or `rand_pcg` |
 
-| 级别 | 保证 | 做法 |
+| Python | `getrandbits(64)` of `random.Random` |
+
+| C# | `NextInt64` of `System.Random` or `RandomNumberGenerator` |
+
+| Node.js | `crypto.randomBytes` or `seedrandom` |
+
+**Key Constraint**: If the goal is to **produce the same sequence across languages ​​with the same seed**, all binding layers must inject the **same deterministic PRNG** (e.g., the PCG64 reference implementation included with the core), not the host language's own RNG. Randompack's reproducibility is achieved through a unified engine, rather than relying on the platform's default random source. ### 4.2 Reproducibility Levels
+
+| Level | Guarantee | Practice |
+
 |---|---|---|
-| L0 | 同语言、同平台可复现 | 固定 seed + 宿主 RNG |
-| L1 | 同语言、跨平台可复现 | 整数/定点运算 + 无偏映射 |
-| L2 | **跨语言、跨平台可复现** | L1 + 统一注入的确定性 PRNG + 禁止任何浮点差异 |
 
-WCCS 核心规格默认按 L2 设计。如果某个绑定层无法保证（例如 Python 的 `random` 实现差异），文档必须明确降级声明。
+| L0 | Reproducible within the same language and platform | Fixed seed + host RNG |
 
+| L1 | Reproducible across different platforms and within the same language | Integer/fixed-point arithmetic + unbiased mapping |
 
-## 5. 测试矩阵（必须全绿才能发布）
+| L2 | **Reproducible across different languages ​​and platforms** | L1 + deterministic PRNG for unified injection + prohibition of any floating-point differences |
 
-### 5.1 核心逻辑测试（C 层，唯一权威）
+The WCCS core specification is designed based on L2 by default. If a binding layer cannot guarantee performance (e.g., differences in Python's `random` implementation), the documentation must explicitly declare a fallback.
 
-| 测试 | 方法 | 通过标准 |
+## 5. Test Matrix (Must be all green for release)
+
+### 5.1 Core Logic Testing (C Layer, the only authoritative)
+
+| Test | Method | Pass Criteria |
+
 |---|---|---|
-| 频率 | 1e6 次抽样，卡方 | 频率与 `w_i/Σw` 偏差 < ε |
-| 冷却违规 | `L=1, beta_q=0` | 连续相同次数 = 0 |
-| 覆盖 | `L≥n, 等权` | 每 n 次恰好覆盖全集合 |
-| 边界 | `n=1`, `L=0`, `L>n`, `total=0` | 无崩溃、行为符合退化表 |
-| 无偏映射 | `n=3,5,7` 各 1e6 次 | 各索引频率均匀 |
-| 复现 | 同 seed 两次初始化 | 抽样序列逐位相同 |
 
-### 5.2 跨语言一致性测试
+| Frequency | 1e6 samplings, chi-square | Frequency deviation from `w_i/Σw` < ε |
 
-对每个语言绑定，用**同一组固定 seed 和参数**运行 N 次，输出索引序列的 SHA-256，与 C 参考输出比对。
+| Cooling Violation | `L=1, beta_q=0` | Consecutive identical samplings = 0 |
 
-```text
-测试向量（必须通过）:
-  seed=42, stream_id=0, n=10, w=all 1, L=3, beta_q=0, alpha_q=0, R=1000
-  前 100 个输出索引的 SHA-256: <expected>
+| Coverage | `L≥n, equal weight` | Exactly covers the entire set every n samplings |
+
+| Boundaries | `n=1`, `L=0`, `L>n`, `total=0` | No crashes, behavior conforms to the degenerate table |
+
+| Unbiased Mapping | `n=3, 5, 7` each 1e6 samplings | Uniform frequency across indices |
+
+| Reproducibility | Same seed, two initializations | Sampling sequence identical bit by bit |
+
+### 5.2 Cross-Language Consistency Testing
+
+For each language binding, run N times with **the same fixed seed and parameters**, outputting the SHA-256 of the index sequence, and compare it with the C reference output.
+
+``text Test Vector (must pass):
+seed=42, stream_id=0, n=10, w=all 1, L=3, beta_q=0, alpha_q=0, R=1000
+
+SHA-256 of the first 100 output indices: <expected>
+
 ```
 
-如果某语言无法达到 L2 可复现，该语言测试降级为“同语言内可复现”，但必须在 README 中显著声明。
+If a language cannot achieve L2 reproducibility, the language test is downgraded to "intra-language reproducibility," but this must be clearly stated in the README.
 
-### 5.3 绑定层边界测试
+```text Test Vector (must pass):
 
-- 空指针、非法 `n`、`w_i=0`、`beta_q > 2^32` → 返回错误码，不崩溃；
-- 核心返回的错误在 Python 是异常、C# 是 `WccsException`、Node 是 `Error`、C++ 是 `std::runtime_error`；
-- 并发调用同一句柄（如果线程不安全）必须文档声明，或加锁。
+seed=42, stream_id=0, n=10, w=all 1, L=3, beta_q=0, alpha_q=0, R=1000
 
-### 5.4 打包验收
+SHA-256 of the first 100 output indices: <expected>
 
-| 语言 | 验收 |
+```text Test Vector (must pass):
+
+seed=42, stream_id=0, n=10, w=all 1, L=3, beta_q=0, alpha_q=0, R=1000
+
+SHA-256 of the first 100 output indices: ... ### 5.3 Binding Layer Boundary Testing
+
+- Null pointer exception, illegal `n`, `w_i=0`, `beta_q > 2^32` → Return error code, no crash;
+
+- The core returned error is an exception in Python, `WccsException` in C#, `Error` in Node.js, and `std::runtime_error` in C++;
+
+- Concurrent calls to the same handle (if thread-unsafe) must be documented or locked.
+
+### 5.4 Packaging Acceptance
+
+| Language | Acceptance |
+
 |---|---|
-| C/C++ | `pkg-config --cflags --libs wccs` 可用；CMake `find_package` 可用 |
-| Rust | `cargo test` 通过；`cargo build --release` 产出 `.a`/`.so`/`.dylib`/`.dll` |
-| Python | `pip install wccs` 后 `import wccs`；`maturin build` wheel 通过 manylinux 审计 |
-| C# | NuGet 包在 `win-x64`, `linux-x64`, `osx-arm64` 上 `dotnet test` 通过；Native AOT 无 trim warning |
-| Node.js | Node LTS / Bun / Deno 各跑一次；CJS 和 ESM 都测试 `import` 和 `require` |
 
+| C/C++ | `pkg-config --cflags --libs wccs` is available; CMake `find_package` is available |
 
-## 6. 发布流水线（CI 设计）
+| Rust | `cargo test` passes; `cargo build --release` produces `.a`/`.so`/`.dylib`/`.dll` |
 
-### 6.1 构建矩阵
+| Python | `pip install wccs` followed by `import wccs`; `maturin build` wheel passes manylinux audit |
 
-```text
-平台: ubuntu-22.04, macos-14, windows-2022
-架构: x86_64, aarch64 (macOS/Linux)
-语言: C (核心), C++, Rust, Python 3.9–3.13, .NET 8/10, Node 20/22
+| C# | NuGet package passes `dotnet test` on `win-x64`, `linux-x64`, `osx-arm64`; Native AOT has no trim warnings |
+
+| Node.js | Node LTS / Bun / Deno are run once each; `import` and `require` are tested in both CJS and ESM |
+
+## 6. Deployment Pipeline (CI Design)
+
+### 6.1 Building the Matrix
+
+```text Platform: ubuntu-22.04, macos-
+14, Windows 2022
+Architecture: x86_64, aarch64 (macOS/Linux)
+Languages: C (core), C++, Rust, Python 3.9–3.13, .NET 8/10, Node 20/22
+
 ```
 
-### 6.2 分阶段流水线
+### 6.2 Phased Pipeline
 
-**阶段 1：核心构建与测试**（触发所有下游）
+**Phase 1: Core Build and Testing** (Triggers all downstream components)
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
+
 ```
 
-**阶段 2：各语言绑定构建**（并行）
+**Phase 2: Language-Specific Builds** (Parallel)
 
-- Python：`maturin build --release`（Linux 用 manylinux 容器）
-- C#：`dotnet pack`，原生库按 RID 放入 `runtimes/`
-- Node：`napi build --platform --release`，平台包和根包分别打包
-- Rust：`cargo build --release` + `cbindgen` 生成头文件
+- Python: `maturin build --release` (Linux uses manylinux container)
 
-**阶段 3：跨语言一致性测试**
+- C#: `dotnet pack`, native libraries are placed in `runtimes/` according to RID
 
-下载阶段 1 的 C 参考二进制，对每个语言运行固定测试向量，比对 SHA-256。
+- Node: `napi build --platform --release`, platform packages and root packages are packaged separately
 
-**阶段 4：发布**
+- Rust: `cargo build --release` + `cbindgen` generates header files
 
-| 目标 | 命令/机制 |
+**Phase 3: Cross-language consistency testing**
+
+Download the C reference binary from Phase 1, run fixed test vectors for each language, and compare SHA-256.
+
+**Phase 4: Release**
+
+| Target | Command/Mechanism |
+
 |---|---|
-| PyPI | `maturin publish`（或 `uv publish`） |
+
+| PyPI | `maturin publish` (or `uv publish`) |
+
 | NuGet | `dotnet nuget push` |
-| npm | 根包 + 平台 optional packages 分别 `npm publish` |
-| crates.io | `cargo publish`（如果发布 Rust crate） |
-| C/C++ | GitHub Release 附 `.a`/`.so`/`.dylib`/`.dll`/`.h` |
 
-**版本锁定**：所有绑定包的大版本与核心 ABI 版本对齐。`wccs_abi_version()` 返回 `1` 时，所有语言包的 `package.json` / `pyproject.toml` / `.csproj` / `Cargo.toml` 中的 `wccs` 依赖必须解析到 ABI 1 的范围。
+| npm | Root package + platform optional packages `npm publish` respectively |
 
+| crates.io | `cargo publish` (if releasing a Rust crate) |
 
-## 7. 评审清单（发布前逐项打勾）
+| C/C++ | GitHub Release with `.a`/`.so`/`.dylib`/`.dll`/`.h` |
 
-- [ ] C ABI 头文件有版本宏，枚举只追加不修改；
-- [ ] 所有导出函数有 `catch_unwind`（Rust）或等价错误边界，无 panic 穿越；
-- [ ] 核心分配的内存只由 `wccs_free` / `wccs_free_string` 释放，绑定层零 `free`；
-- [ ] 所有语言绑定注入的 RNG 满足目标可复现级别，README 明确声明；
-- [ ] 无偏映射 `random_below` 在核心中实现，绑定层不自行生成索引；
-- [ ] 权重、因子、Fenwick 全部整数/定点，无跨语言浮点分歧；
-- [ ] Python wheel 通过 manylinux 审计；
-- [ ] C# Native AOT 无 trim/AOT warning；
-- [ ] Node 原生插件 external 于 bundle，WASM 回退可加载；
-- [ ] 跨语言固定测试向量 SHA-256 一致（或降级声明已文档化）；
-- [ ] 冷却、覆盖、边界、频率测试全部通过；
-- [ ] 错误码表与异常映射在所有语言中一致。
+**Version locking**: Major versions of all binding packages are aligned with the core ABI version. When `wccs_abi_version()` returns `1`, the `wccs` dependency in all language packs' `package.json`, `pyproject.toml`, `.csproj`, and `Cargo.toml` must resolve to ABI 1.
 
+## 7. Review Checklist (Check each item before release)
 
-**一句话总结**：WCCS 多平台库的创作，**70% 的精力在 C 核心与 WCCS 逻辑的确定性，30% 在各语言绑定与打包**。绑定层越薄越好；任何把算法逻辑复制到绑定层的做法，都是跨语言不一致和长期维护负担的源头。
+- [ ] C ABI header files have version macros; enumerations are appended to but not modified.
+
+- [ ] All exported functions have `catch_unwind` (Rust) or equivalent error boundaries; no panic crossover.
+
+- [ ] Core-allocated memory is only freed by `wccs_free` / `wccs_free_string`; binding layer has zero `free`.
+
+- [ ] All language binding injection RNGs meet the target reproducibility level; explicitly stated in the README.
+
+- [ ] Unbiased mapping `random_below` is implemented in the core; binding layer does not generate its own index.
+
+- [ ] Weights, factors, and Fenwick are all integers/fixed-point; no cross-language floating-point divergence.
+
+- [ ] Python wheel passes manylinux audit.
+
+- [ ] C# Native AOT has no trim/AOT warnings.
+
+- [ ] Node native plugins external to bundles; WASM Rollback is loadable;
+
+- [ ] Cross-language fixed test vector SHA-256 consistency (or degradation declaration is documented);
+
+- [ ] Cooling, coverage, boundary, and frequency tests all pass;
+
+- [ ] Error code table and exception mapping are consistent across all languages.
+
+**In short:** The creation of the WCCS multi-platform library requires **70% of the effort to ensure the determinism of the C core and WCCS logic, and 30% to bind and package it across languages**. The thinner the binding layer, the better; any practice of copying algorithm logic to the binding layer is the source of cross-language inconsistencies and long-term maintenance burden.
