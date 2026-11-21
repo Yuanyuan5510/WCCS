@@ -152,8 +152,8 @@ int idx = s.Sample();
 <summary>Node.js (CJS + ESM)</summary>
 
 ```js
-const { Sampler } = require('wccs');                 // CJS
-// import { Sampler } from 'wccs';                  // ESM
+const { Sampler } = require('@yuanyuan5510/wccs');  // CJS
+// import { Sampler } from '@yuanyuan5510/wccs';   // ESM
 const s = new Sampler([1, 2, 3, 4], { L: 3, R: 1000, seed: 42 });
 const idx = s.sample();
 s.close();

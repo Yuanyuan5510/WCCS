@@ -344,26 +344,22 @@ jobs:
         id: pypi-token
         env:
           PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-          # PyPI publication is deliberately opt-in. The original token was
-          # exposed in chat and has been revoked; keep this off until a fresh
-          # token is stored and PUBLISH_PYPI is set to "true" in repo variables.
-          ENABLE_PYPI: ${{ vars.PUBLISH_PYPI }}
         run: |
           # Step-level env is NOT visible to `if:` expressions, so testing
           # env.PYPI_TOKEN there always evaluates as empty and silently skips
           # the upload even when the secret is set. Evaluate in the shell and
           # pass the result through a step output instead.
-          if [ "$ENABLE_PYPI" != "true" ]; then
-            echo "::warning::PyPI publication is paused; set the repo variable PUBLISH_PYPI=true to enable it. Wheels were built but not uploaded."
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          #
+          # Publication follows the secret: a valid PYPI_TOKEN means publish,
+          # an absent one means an explicit warning-and-skip (never a silent
+          # green job). If the token was revoked but left in the secret, the
+          # upload fails loudly with 401 instead of pretending to succeed.
           if [ -z "$PYPI_TOKEN" ]; then
-            echo "::error::PUBLISH_PYPI is enabled but PYPI_TOKEN is not set"
+            echo "::warning::PYPI_TOKEN secret is not set; wheels were built but not uploaded."
             echo "present=false" >> "$GITHUB_OUTPUT"
-            exit 1
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "present=true" >> "$GITHUB_OUTPUT"
 
       - name: Publish to PyPI
         if: steps.pypi-token.outputs.present == 'true'
@@ -372,6 +368,28 @@ jobs:
           password: ${{ secrets.PYPI_TOKEN }}
           packages-dir: dist/
           skip-existing: true
+
+      - name: Verify the release is actually on PyPI
+        if: steps.pypi-token.outputs.present == 'true'
+        shell: bash
+        run: |
+          # skip-existing turns both "already published" and "filename was
+          # used by a release that has since been deleted" into a no-op, so a
+          # green upload step does not prove the package is live. Check it.
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              "https://pypi.org/pypi/wccs/${VERSION}/json" || true)
+            if [ "$code" = "200" ]; then
+              echo "PyPI serves wccs ${VERSION}"
+              exit 0
+            fi
+            echo "attempt $i: HTTP $code, retrying"
+            sleep 6
+          done
+          echo "::error::wccs ${VERSION} is not visible on PyPI after upload"
+          exit 1
 
   # ---------------------------------------------------------------- stage 7
   publish-npm:
@@ -427,10 +445,12 @@ jobs:
           set -euo pipefail
           if [ -z "$NODE_AUTH_TOKEN" ]; then echo "::warning::NPM_TOKEN is not set"; exit 0; fi
           VERSION="${GITHUB_REF_NAME#v}"
-          TGZ=$(find npm-root -maxdepth 1 -name 'wccs-*.tgz' | head -1)
+          # A scoped package packs to yuanyuan5510-wccs-1.0.0.tgz, not
+          # wccs-1.0.0.tgz, so match any tarball here.
+          TGZ=$(find npm-root -maxdepth 1 -name '*.tgz' | head -1)
           test -n "$TGZ" || { echo "::error::root tarball not found"; exit 1; }
-          if npm view "wccs@${VERSION}" version >/dev/null 2>&1; then
-            echo "wccs@${VERSION} already published; skipping"
+          if npm view "@yuanyuan5510/wccs@${VERSION}" version >/dev/null 2>&1; then
+            echo "@yuanyuan5510/wccs@${VERSION} already published; skipping"
             exit 0
           fi
           # A bare "npm-root/wccs-1.0.0.tgz" is parsed by npm as the GitHub
