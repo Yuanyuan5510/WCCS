@@ -80,7 +80,7 @@ same `stream_id` scheme) or add external locking in the host application.
 
 The root [`VERSION`](../VERSION) file is the single source of truth. All
 binding packages (`pyproject.toml`, `Cargo.toml`, `package.json`) are at
-`1.0.0` and target ABI 1; `CMakeLists.txt` reads `VERSION` directly.
+`1.0.1` and target ABI 1; `CMakeLists.txt` reads `VERSION` directly.
 
 CI enforces the rule before building anything:
 

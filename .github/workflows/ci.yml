@@ -240,39 +240,67 @@ jobs:
           # A PEP 427 build number produces wccs-<version>-1-<tag>.whl, a new
           # filename, while the package version stays the same. Bump
           # WHEEL_BUILD when a release has to be pushed a second time.
-          WHEEL_BUILD=${WHEEL_BUILD:-1}
-          echo "wheel build number: $WHEEL_BUILD"
+          # WHEEL_BUILD is normally empty so filenames stay canonical. Set it
+          # (e.g. WHEEL_BUILD=1) only when a version must be uploaded again
+          # after its release was deleted on PyPI.
+          BUILD_ARGS=()
+          if [ -n "${WHEEL_BUILD:-}" ]; then
+            echo "wheel build number: $WHEEL_BUILD"
+            BUILD_ARGS+=("--config-setting=--build-option=--build-number=$WHEEL_BUILD")
+          fi
           python -m build --wheel --outdir dist/wheels \
             --config-setting="--build-option=--plat-name=$PLAT" \
-            --config-setting="--build-option=--build-number=$WHEEL_BUILD" \
-            bindings/python
+            "${BUILD_ARGS[@]}" bindings/python
           ls -l dist/wheels
 
       - name: npm packages (root tarball + platform package)
         shell: bash
         run: |
           case "$RUNNER_OS" in
-            Windows) PKG=wccs-win32-x64;     OS=win32;  CPU=x64 ;;
-            Linux)   PKG=wccs-linux-x64-gnu; OS=linux;  CPU=x64 ;;
-            macOS)   PKG=wccs-darwin-arm64;  OS=darwin; CPU=arm64 ;;
+            Windows) SUFFIX=win32-x64;     OS=win32;  CPU=x64 ;;
+            Linux)   SUFFIX=linux-x64-gnu; OS=linux;  CPU=x64 ;;
+            macOS)   SUFFIX=darwin-arm64;  OS=darwin; CPU=arm64 ;;
           esac
+          SCOPE="@yuanyuan5510"
+          PKG="$SCOPE/wccs-$SUFFIX"
+          DIR="wccs-$SUFFIX"
           VERSION=$(tr -d '[:space:]' < VERSION)
-          mkdir -p "dist/npm-platform/$PKG" dist/npm
-          cp "$WCCS_LIB" "dist/npm-platform/$PKG/"
-          cat > "dist/npm-platform/$PKG/package.json" <<EOF
+          mkdir -p "dist/npm-platform/$DIR" dist/npm
+          cp "$WCCS_LIB" "dist/npm-platform/$DIR/"
+          cat > "dist/npm-platform/$DIR/package.json" <<EOF
           {
             "name": "$PKG",
             "version": "$VERSION",
             "description": "Prebuilt WCCS native library for $OS-$CPU",
             "license": "Apache-2.0",
+            "publishConfig": { "access": "public" },
             "os": ["$OS"],
             "cpu": ["$CPU"],
             "files": ["*.dll", "*.so", "*.dylib"],
             "repository": { "type": "git", "url": "https://github.com/Yuanyuan5510/WCCS.git" }
           }
           EOF
+          # Inject optionalDependencies into the root tarball at pack time only.
+          # Keeping them out of the checked-in package.json lets "npm ci" run in
+          # CI before those platform packages exist on the registry; the
+          # published tarball still declares them so installs pull the native
+          # library automatically.
+          cp bindings/node/package.json "$RUNNER_TEMP/package.json.orig"
+          node - "$VERSION" <<'NODE'
+          const fs = require('fs');
+          const version = process.argv[2];
+          const p = 'bindings/node/package.json';
+          const pkg = JSON.parse(fs.readFileSync(p, 'utf8'));
+          pkg.optionalDependencies = {
+            '@yuanyuan5510/wccs-win32-x64': version,
+            '@yuanyuan5510/wccs-linux-x64-gnu': version,
+            '@yuanyuan5510/wccs-darwin-arm64': version,
+          };
+          fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + '\n');
+          NODE
           npm pack ./bindings/node --pack-destination "$GITHUB_WORKSPACE/dist/npm"
-          ls -l "dist/npm-platform/$PKG" dist/npm
+          cp "$RUNNER_TEMP/package.json.orig" bindings/node/package.json
+          ls -l "dist/npm-platform/$DIR" dist/npm
 
       - name: C# library + native dependency
         shell: bash

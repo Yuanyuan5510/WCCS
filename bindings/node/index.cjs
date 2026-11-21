@@ -22,9 +22,9 @@ const ErrorCodes = Object.freeze({
 });
 
 const PLATFORM_PACKAGES = {
-  'win32-x64': 'wccs-win32-x64',
-  'linux-x64': 'wccs-linux-x64-gnu',
-  'darwin-arm64': 'wccs-darwin-arm64',
+  'win32-x64': '@yuanyuan5510/wccs-win32-x64',
+  'linux-x64': '@yuanyuan5510/wccs-linux-x64-gnu',
+  'darwin-arm64': '@yuanyuan5510/wccs-darwin-arm64',
 };
 
 // Release tarballs ship the native library in a platform-specific optional

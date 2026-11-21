@@ -239,11 +239,14 @@ bindings/python/tests`, `dotnet run --project bindings/csharp/Wccs.Tests`,
 4. **package** — only on a matching `v*` tag or a manual run. Builds:
    - C/C++ SDK (`cmake --install` layout: lib, headers, `wccs.pc`, CMake config)
    - Python wheel with the native library bundled next to `wccs/__init__.py`
-   - npm tarball with the native library bundled
+   - npm root tarball plus one platform package per OS
+     (`@yuanyuan5510/wccs-win32-x64`, `-linux-x64-gnu`, `-darwin-arm64`)
    - C# assembly plus its native dependency
    - self-contained Rust crate (C source vendored under `vendor/`)
 5. **release** — on a matching `v*` tag, publishes every platform bundle and
    the WASM output to a GitHub Release.
+6. **publish** — four idempotent jobs (PyPI, npm, NuGet, crates.io) run on the
+   same tag and read their tokens from the `release` environment.
 
 A plain push to `main` stops after the tests, so day-to-day commits stay fast.
 
@@ -252,12 +255,22 @@ Cut a release with:
 ```bash
 # 1. bump VERSION and the three package manifests to the same value
 # 2. commit, then tag with that exact version
-git tag -a v1.0.0 -m "WCCS 1.0.0 (C ABI 1)"
-git push origin main v1.0.0
+git tag -a v1.0.1 -m "WCCS 1.0.1 (C ABI 1)"
+git push origin main v1.0.1
 ```
 
-Uploading to PyPI / NuGet / npm / crates.io still needs registry tokens and is
-a manual step; see [`docs/REVIEW_CHECKLIST.md`](docs/REVIEW_CHECKLIST.md).
+Registry publication is automated but idempotent: every publish job skips a
+version that already exists, so a tag can be re-run safely.
+
+Two registry behaviours are worth knowing before deleting a published release:
+
+- **PyPI** permanently reserves a filename once it has been uploaded. If a
+  release is deleted, re-uploading the same wheel fails with `400 This filename
+  was previously used`. Bump `VERSION`, or pass `WHEEL_BUILD=1` to `package` to
+  emit `wccs-<version>-1-<tag>.whl`.
+- **npm** blocks the name of a deleted package for 24 hours, regardless of
+  version. Platform packages therefore use scoped names, which are also exempt
+  from npm's "name too similar" rule that rejects unscoped `wccs`.
 
 ## Repository layout
 
