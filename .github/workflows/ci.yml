@@ -232,8 +232,20 @@ jobs:
             PLAT=$(python -c "import sysconfig;p=sysconfig.get_platform();print(p.replace('-','_').replace('.','_'))")
           fi
           echo "wheel platform: $PLAT"
+          # PyPI permanently reserves the filename of every file that was ever
+          # uploaded, even after the release is deleted. Re-uploading
+          # wccs-<version>-<tag>.whl after a deletion therefore fails with
+          # "400 This filename was previously used by a file that has since
+          # been deleted", and skip-existing does not cover that case.
+          # A PEP 427 build number produces wccs-<version>-1-<tag>.whl, a new
+          # filename, while the package version stays the same. Bump
+          # WHEEL_BUILD when a release has to be pushed a second time.
+          WHEEL_BUILD=${WHEEL_BUILD:-1}
+          echo "wheel build number: $WHEEL_BUILD"
           python -m build --wheel --outdir dist/wheels \
-            --config-setting="--build-option=--plat-name=$PLAT" bindings/python
+            --config-setting="--build-option=--plat-name=$PLAT" \
+            --config-setting="--build-option=--build-number=$WHEEL_BUILD" \
+            bindings/python
           ls -l dist/wheels
 
       - name: npm packages (root tarball + platform package)
@@ -373,22 +385,31 @@ jobs:
         if: steps.pypi-token.outputs.present == 'true'
         shell: bash
         run: |
-          # skip-existing turns both "already published" and "filename was
-          # used by a release that has since been deleted" into a no-op, so a
-          # green upload step does not prove the package is live. Check it.
+          # skip-existing turns "already published" into a silent no-op, so a
+          # green upload step does not prove every platform wheel is live.
+          # Compare the collected wheels against what PyPI actually serves.
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           for i in $(seq 1 10); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' \
-              "https://pypi.org/pypi/wccs/${VERSION}/json" || true)
-            if [ "$code" = "200" ]; then
-              echo "PyPI serves wccs ${VERSION}"
-              exit 0
+            if curl -sf "https://pypi.org/pypi/wccs/${VERSION}/json" -o /tmp/pypi.json; then
+              ok=1
+              for w in dist/*.whl; do
+                fn=$(basename "$w")
+                if ! grep -q "\"$fn\"" /tmp/pypi.json; then
+                  echo "missing on PyPI: $fn"
+                  ok=0
+                fi
+              done
+              if [ "$ok" = "1" ]; then
+                echo "all platform wheels are live on PyPI ${VERSION}"
+                exit 0
+              fi
+            else
+              echo "attempt $i: version page not available yet"
             fi
-            echo "attempt $i: HTTP $code, retrying"
             sleep 6
           done
-          echo "::error::wccs ${VERSION} is not visible on PyPI after upload"
+          echo "::error::wccs ${VERSION} is incomplete on PyPI after upload"
           exit 1
 
   # ---------------------------------------------------------------- stage 7
