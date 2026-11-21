@@ -340,21 +340,38 @@ jobs:
           echo "wheels to publish:"
           ls -1 dist
 
-      - name: Publish to PyPI
-        if: env.PYPI_TOKEN != ''
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Check PyPI token
+        id: pypi-token
         env:
           PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+          # PyPI publication is deliberately opt-in. The original token was
+          # exposed in chat and has been revoked; keep this off until a fresh
+          # token is stored and PUBLISH_PYPI is set to "true" in repo variables.
+          ENABLE_PYPI: ${{ vars.PUBLISH_PYPI }}
+        run: |
+          # Step-level env is NOT visible to `if:` expressions, so testing
+          # env.PYPI_TOKEN there always evaluates as empty and silently skips
+          # the upload even when the secret is set. Evaluate in the shell and
+          # pass the result through a step output instead.
+          if [ "$ENABLE_PYPI" != "true" ]; then
+            echo "::warning::PyPI publication is paused; set the repo variable PUBLISH_PYPI=true to enable it. Wheels were built but not uploaded."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$PYPI_TOKEN" ]; then
+            echo "::error::PUBLISH_PYPI is enabled but PYPI_TOKEN is not set"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "present=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to PyPI
+        if: steps.pypi-token.outputs.present == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_TOKEN }}
           packages-dir: dist/
           skip-existing: true
-
-      - name: Warn when the token is missing
-        if: env.PYPI_TOKEN == ''
-        env:
-          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-        run: echo "::warning::PYPI_TOKEN secret is not set; wheels were built but not uploaded."
 
   # ---------------------------------------------------------------- stage 7
   publish-npm:
@@ -388,17 +405,39 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          set -euo pipefail
           if [ -z "$NODE_AUTH_TOKEN" ]; then echo "::warning::NPM_TOKEN is not set"; exit 0; fi
           for d in npm-platform/*/; do
-            [ -f "$d/package.json" ] && npm publish "$d" --access public
+            [ -f "$d/package.json" ] || continue
+            name=$(node -p "require('./$d/package.json').name")
+            ver=$(node -p "require('./$d/package.json').version")
+            if npm view "${name}@${ver}" version >/dev/null 2>&1; then
+              echo "${name}@${ver} already published; skipping"
+              continue
+            fi
+            # Leading ./ forces npm to treat this as a local directory,
+            # not a GitHub "owner/repo" package spec.
+            npm publish "./${d}" --access public
           done
 
       - name: Publish root package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          set -euo pipefail
           if [ -z "$NODE_AUTH_TOKEN" ]; then echo "::warning::NPM_TOKEN is not set"; exit 0; fi
-          npm publish npm-root/*.tgz --access public
+          VERSION="${GITHUB_REF_NAME#v}"
+          TGZ=$(find npm-root -maxdepth 1 -name 'wccs-*.tgz' | head -1)
+          test -n "$TGZ" || { echo "::error::root tarball not found"; exit 1; }
+          if npm view "wccs@${VERSION}" version >/dev/null 2>&1; then
+            echo "wccs@${VERSION} already published; skipping"
+            exit 0
+          fi
+          # A bare "npm-root/wccs-1.0.0.tgz" is parsed by npm as the GitHub
+          # shorthand github:npm-root/wccs-1.0.0.tgz, which triggers
+          # "git ls-remote ssh://git@github.com/... Permission denied".
+          # The ./ prefix makes it an unambiguous local tarball.
+          npm publish "./${TGZ}" --access public
 
   # ---------------------------------------------------------------- stage 8
   publish-nuget:
@@ -474,15 +513,26 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          set -euo pipefail
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
             echo "::warning::CARGO_REGISTRY_TOKEN is not set"; exit 0
           fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          # crates.io is immutable: republishing an existing version fails.
+          # Skip on a re-run of the same tag so the other registries can be
+          # retried safely.
+          if curl -fsS -H "User-Agent: wccs-ci" \
+               "https://crates.io/api/v1/crates/wccs/${VERSION}" >/dev/null 2>&1; then
+            echo "wccs@${VERSION} already on crates.io; skipping"
+            exit 0
+          fi
           cargo publish --manifest-path bindings/rust/Cargo.toml --allow-dirty
 
-# Publishing to the language registries is still a manual step and needs
-# repository secrets:
-#   PyPI      : upload dist/wheels/*.whl (build a manylinux/macosx/win wheel)
-#   NuGet     : dotnet nuget push with native libs under runtimes/{rid}/native/
-#   npm       : npm publish dist/npm/*.tgz
-#   crates.io : cargo publish dist/rust/*.crate
+# Registry publication runs only on a v* tag that passed the version gate.
+# All four publish jobs are idempotent so a tag can be re-run safely:
+#   PyPI      : skip-existing
+#   npm       : npm view <name>@<version> before publishing
+#   NuGet     : --skip-duplicate
+#   crates.io : crates.io version lookup before cargo publish
+# Secrets live in the "release" environment; each publish job declares it.
 # All binding versions must resolve to the same WCCS_ABI_VERSION (section 6).
