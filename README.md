@@ -90,6 +90,15 @@ build` (set the prefix at **configure** time — `wccs.pc` embeds it).
 
 ## Quick start by language
 
+### Install from package registries
+
+```bash
+dotnet add package Wccs --version 1.0.1
+cargo add wccs
+npm i @yuanyuan5510/wccs
+pip install wccs
+```
+
 <details open>
 <summary>C</summary>
 
