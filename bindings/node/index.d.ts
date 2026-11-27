@@ -27,7 +27,7 @@ export class Sampler {
 export const ErrorCodes: {
   readonly OK: 0; readonly E_INVAL: 1; readonly E_NOMEM: 2;
   readonly E_OVERFLOW: 3; readonly E_EMPTY: 4;
-  readonly E_NULL: 5; readonly E_STATE: 6;
+  readonly E_NULL: 5; readonly E_STATE: 6; readonly E_STREAM_CONFLICT: 7;
 };
 export const ABI_VERSION: 1;
 export function abiVersion(): number;

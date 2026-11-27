@@ -11,6 +11,7 @@ public static class ErrorCodes
     public const int E_EMPTY = 4;
     public const int E_NULL = 5;
     public const int E_STATE = 6;
+    public const int E_STREAM_CONFLICT = 7;
 }
 
 /// <summary>Stable WCCS error surfaced as a managed exception.</summary>

@@ -18,12 +18,14 @@ const ABI_VERSION = 1;
 
 const ErrorCodes = Object.freeze({
   OK: 0, E_INVAL: 1, E_NOMEM: 2, E_OVERFLOW: 3,
-  E_EMPTY: 4, E_NULL: 5, E_STATE: 6,
+  E_EMPTY: 4, E_NULL: 5, E_STATE: 6, E_STREAM_CONFLICT: 7,
 });
 
 const PLATFORM_PACKAGES = {
   'win32-x64': '@yuanyuan5510/wccs-win32-x64',
+  'win32-ia32': '@yuanyuan5510/wccs-win32-ia32',
   'linux-x64': '@yuanyuan5510/wccs-linux-x64-gnu',
+  'linux-ia32': '@yuanyuan5510/wccs-linux-ia32',
   'darwin-arm64': '@yuanyuan5510/wccs-darwin-arm64',
 };
 

@@ -20,6 +20,7 @@ from pathlib import Path
 __all__ = [
     "Sampler", "WccsError", "abi_version",
     "OK", "E_INVAL", "E_NOMEM", "E_OVERFLOW", "E_EMPTY", "E_NULL", "E_STATE",
+    "E_STREAM_CONFLICT",
 ]
 
 OK = 0
@@ -29,6 +30,7 @@ E_OVERFLOW = 3
 E_EMPTY = 4
 E_NULL = 5
 E_STATE = 6
+E_STREAM_CONFLICT = 7  # duplicate live (seed, stream_id); optional detector only
 
 _u64 = ctypes.c_uint64
 _i32 = ctypes.c_int32

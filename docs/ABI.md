@@ -1,6 +1,10 @@
 # WCCS C ABI contract
 
-`include/wccs.h` is the **only stable contract**. Version: `WCCS_ABI_VERSION 1`.
+`include/wccs.h` is the **only stable API surface**. Version: `WCCS_ABI_VERSION 1`.
+
+This file defines *what symbols exist*. [`CONTRACT.md`](CONTRACT.md) defines
+*what they must do* where `work.md` is silent or self-contradictory; it is
+authoritative over the manual and governs every binding test vector.
 
 ## Rules
 
@@ -27,6 +31,8 @@
 | `wccs_error_string` | Static human-readable message for an error code. |
 | `wccs_step` / `wccs_total` / `wccs_last_error` | Read-only state helpers. |
 | `wccs_pcg64_init` / `wccs_pcg64_next` | Reference PRNG, useful when building a custom `wccs_rng_t`. |
+| `wccs_stream_check` | Enable the optional duplicate `(seed, stream_id)` detector; returns the previous mode (`0` off, `1` warn, `2` error). See `CONTRACT.md` §5. |
+| `wccs_stream_check_mode` | Read the current detector mode. |
 
 ## Error codes (stable, append only)
 
@@ -34,11 +40,12 @@
 |---|---|---|
 | `WCCS_OK` | 0 | success |
 | `WCCS_E_INVAL` | 1 | `n<=0`, `w==NULL`, any `w_i==0`, `L<0`, `R<1`, `beta_q`/`alpha_q > 2^32`, missing RNG callback |
-| `WCCS_E_NOMEM` | 2 | allocation failure |
+| `WCCS_E_NOMEM` | 2 | allocation failure, or `n * sizeof(uint64_t)` exceeds the target's `size_t` (32-bit builds) |
 | `WCCS_E_OVERFLOW` | 3 | `Σ w_i` exceeds `uint64` |
 | `WCCS_E_EMPTY` | 4 | all dynamic weights are zero (after cooldown reset) |
 | `WCCS_E_NULL` | 5 | `NULL` context passed to a method |
 | `WCCS_E_STATE` | 6 | internal invariant violated (defensive) |
+| `WCCS_E_STREAM_CONFLICT` | 7 | two live contexts share `(seed, stream_id)`; only when `wccs_stream_check(2)` is active |
 
 Binding-layer exception mapping (§5.3):
 
@@ -66,8 +73,21 @@ stream_id    uint64            parallel stream id / PRNG stream selector
 
 ## Thread safety
 
-One `wccs_ctx` is **not thread-safe**. Use one context per thread (with the
-same `stream_id` scheme) or add external locking in the host application.
+One `wccs_ctx` is **not thread-safe**. Use one context per thread and give
+each thread a **distinct `stream_id`**; add external locking if a context must
+be shared.
+
+Two live contexts with the same `(seed, stream_id)` produce identical
+sequences. That is required for L2 reproducibility tests and is therefore
+allowed by default, but it is a silent error in a parallel run. Enable the
+optional detector before creating contexts:
+
+```c
+wccs_stream_check(2);   /* 2 = fail with WCCS_E_STREAM_CONFLICT, 1 = warn, 0 = off */
+```
+
+Serial reuse of a key (free, then construct again) is always legal. See
+`CONTRACT.md` §5 for the registry size, thread-safety and fallback rules.
 
 ## Windows export macro
 
@@ -80,7 +100,7 @@ same `stream_id` scheme) or add external locking in the host application.
 
 The root [`VERSION`](../VERSION) file is the single source of truth. All
 binding packages (`pyproject.toml`, `Cargo.toml`, `package.json`) are at
-`1.0.1` and target ABI 1; `CMakeLists.txt` reads `VERSION` directly.
+`1.0.2` and target ABI 1; `CMakeLists.txt` reads `VERSION` directly.
 
 CI enforces the rule before building anything:
 

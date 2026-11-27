@@ -5,15 +5,120 @@
  * Pure C99, no host-language runtime, no floating point, no __int128.
  * Every arithmetic path is integer / Q32 fixed point so that the same
  * (seed, stream_id, parameters) produces the identical index sequence on
- * every platform (L2 reproducibility, see docs/REPRODUCIBILITY.md).
+ * every platform (L2 reproducibility).
+ *
+ * The manual (work.md) leaves several cases undefined or self-contradictory.
+ * docs/CONTRACT.md is the authoritative ruling and is the reference for
+ * every binding-level test vector. This file implements that contract.
  */
 #include "wccs.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #define ONE_Q32 (1ULL << 32)
+
+/* ------------------------------------------------------------------ *
+ * Optional (seed, stream_id) conflict detector (CONTRACT.md section 5).
+ *
+ * Disabled by default: two live contexts with the same key intentionally
+ * produce the same sequence for reproducibility tests, but that is a
+ * silent error in a parallel run. Enabling it in a debug build turns the
+ * silent error into a warning or a hard construction failure.
+ *
+ * The registry is process-global and protected by a compare-and-swap
+ * spin lock. Platforms without atomics degrade to a single-threaded
+ * fallback, which is sufficient for the debug use case.
+ * ------------------------------------------------------------------ */
+#define WCCS_STREAM_SLOTS 256
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#  include <intrin.h>
+#  define WCCS_CAS(ptr, oldv, newv) \
+     (_InterlockedCompareExchange((volatile long *)(ptr), (long)(newv), (long)(oldv)) == (long)(oldv))
+#  define WCCS_RELEASE(ptr) _InterlockedExchange((volatile long *)(ptr), 0L)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define WCCS_CAS(ptr, oldv, newv) __sync_bool_compare_and_swap((ptr), (oldv), (newv))
+#  define WCCS_RELEASE(ptr)         __sync_lock_release(ptr)
+#else
+#  define WCCS_CAS(ptr, oldv, newv) \
+     (*(ptr) == (oldv) ? (*(ptr) = (newv), 1) : 0)
+#  define WCCS_RELEASE(ptr)         (*(ptr) = 0)
+#endif
+
+typedef struct {
+    uint64_t       seed;
+    uint64_t       stream;
+    volatile long  used;
+} wccs_stream_slot;
+
+static volatile long  g_stream_guard = 0;
+static int32_t        g_stream_mode  = 0;   /* 0 = off, 1 = warn, 2 = error */
+static wccs_stream_slot g_stream_slots[WCCS_STREAM_SLOTS];
+
+static void stream_lock(void)
+{
+    while (!WCCS_CAS(&g_stream_guard, 0L, 1L)) { }
+}
+static void stream_unlock(void) { WCCS_RELEASE(&g_stream_guard); }
+
+/* Returns WCCS_OK (possibly with a warning) or WCCS_E_STREAM_CONFLICT.
+ * *slot_out is the claimed slot, or -1 when the check is off / full. */
+static int32_t stream_register(uint64_t seed, uint64_t stream_id,
+                               int32_t mode, int32_t *slot_out)
+{
+    int s, found = -1;
+    *slot_out = -1;
+    if (mode == 0) return WCCS_OK;
+
+    stream_lock();
+    for (s = 0; s < WCCS_STREAM_SLOTS; ++s) {
+        if (g_stream_slots[s].used) {
+            if (g_stream_slots[s].seed == seed &&
+                g_stream_slots[s].stream == stream_id) {
+                stream_unlock();
+                if (mode == 1) {
+                    fputs("wccs: warning: two live contexts share the same "
+                          "(seed, stream_id)\n", stderr);
+                    return WCCS_OK;
+                }
+                return WCCS_E_STREAM_CONFLICT;
+            }
+        } else if (found < 0) {
+            found = s;
+        }
+    }
+    if (found < 0) {
+        stream_unlock();
+        fputs("wccs: warning: stream conflict registry is full\n", stderr);
+        return WCCS_OK;              /* never fail a valid construction */
+    }
+    g_stream_slots[found].seed   = seed;
+    g_stream_slots[found].stream = stream_id;
+    g_stream_slots[found].used   = 1;
+    stream_unlock();
+    *slot_out = found;
+    return WCCS_OK;
+}
+
+static void stream_unregister(int32_t slot)
+{
+    if (slot < 0) return;
+    stream_lock();
+    g_stream_slots[slot].used = 0;
+    stream_unlock();
+}
+
+int32_t wccs_stream_check(int32_t mode)
+{
+    int32_t prev = g_stream_mode;
+    g_stream_mode = (mode >= 0 && mode <= 2) ? mode : 0;
+    return prev;
+}
+
+int32_t wccs_stream_check_mode(void) { return g_stream_mode; }
 
 /* ------------------------------------------------------------------ *
  * Portable 128-bit helpers (pure C99: no __int128, works on MSVC too)
@@ -115,10 +220,13 @@ struct wccs_ctx {
     uint64_t *actual;              /* sampled counts,         [n]   */
     int64_t  *credit;              /* Q32 credit,             [n]   */
     uint64_t *cooldown;            /* Q32 cooldown factor,    [n]   */
+    uint32_t *cool_count;          /* occurrences in recent[], [n]   */
 
     int32_t  *recent;              /* ring buffer,            [L]   */
     int32_t   recent_head;         /* next write slot == oldest when full */
     int32_t   recent_count;
+    int32_t   last_index;          /* previous draw, -1 before the first */
+    int32_t   stream_slot;         /* -1 when not registered            */
 
     uint64_t  step;
     wccs_rng_t rng;
@@ -153,7 +261,17 @@ static uint64_t calc_v(const wccs_ctx *c, int32_t i)
     int64_t base = (int64_t)c->w[i] + delta;
     if (base < 0) base = 0;                        /* max(0, ...) */
 
-    return mul128_shr32((uint64_t)base, c->cooldown[i]);
+    {
+        uint64_t v = mul128_shr32((uint64_t)base, c->cooldown[i]);
+        /* CONTRACT.md section 3: a strictly positive soft cooldown must
+         * never truncate to zero. Without this floor, beta_q < 2^32 turns
+         * small integer weights into a *hard* cooldown (v = 0), i.e. the
+         * "soft cooldown" degeneracy silently disappears. beta_q == 0 is
+         * strict and beta_q == 2^32 is off; neither may receive a floor. */
+        if (base > 0 && c->cooldown[i] > 0 && c->cooldown[i] < ONE_Q32 &&
+            v == 0) v = 1;
+        return v;
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -253,29 +371,46 @@ static void rebuild_credit(wccs_ctx *c)
 void wccs_free(wccs_ctx *c)
 {
     if (!c) return;
+    stream_unregister(c->stream_slot);
     free(c->w);
     free(c->bit);
     free(c->cur);
     free(c->actual);
     free(c->credit);
     free(c->cooldown);
+    free(c->cool_count);
     free(c->recent);
     free(c);
 }
 
 static wccs_ctx *ctx_alloc(int32_t n, int32_t L)
 {
-    wccs_ctx *c = (wccs_ctx *)calloc(1, sizeof(wccs_ctx));
+    wccs_ctx *c;
+    size_t nn;
+
+    /* On a 32-bit target size_t is 32 bits and n * 8 wraps. Reject before
+     * allocating so an oversized n is a capacity error, never a short
+     * buffer. n + 1 is computed in size_t for the same reason. */
+    if (n <= 0 || (uint64_t)n > (uint64_t)(SIZE_MAX / sizeof(uint64_t)) - 1ULL)
+        return NULL;
+    if (L > 0 && (uint64_t)L > (uint64_t)(SIZE_MAX / sizeof(int32_t)))
+        return NULL;
+
+    c = (wccs_ctx *)calloc(1, sizeof(wccs_ctx));
     if (!c) return NULL;
-    c->w        = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
-    c->bit      = (uint64_t *)calloc((size_t)(n + 1), sizeof(uint64_t));
+    nn = (size_t)n;
+    c->last_index  = -1;
+    c->stream_slot = -1;
+    c->w        = (uint64_t *)calloc(nn, sizeof(uint64_t));
+    c->bit      = (uint64_t *)calloc(nn + 1, sizeof(uint64_t));
     c->cur      = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
     c->actual   = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
     c->credit   = (int64_t  *)calloc((size_t)n, sizeof(int64_t));
     c->cooldown = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    c->cool_count = (uint32_t *)calloc((size_t)n, sizeof(uint32_t));
     if (L > 0) c->recent = (int32_t *)calloc((size_t)L, sizeof(int32_t));
     if (!c->w || !c->bit || !c->cur || !c->actual || !c->credit ||
-        !c->cooldown || (L > 0 && !c->recent)) {
+        !c->cooldown || !c->cool_count || (L > 0 && !c->recent)) {
         wccs_free(c);
         return NULL;
     }
@@ -292,6 +427,7 @@ wccs_ctx* wccs_new(
     uint64_t W = 0;
     int32_t e = WCCS_OK;
     int32_t i;
+    int32_t stream_slot = -1;
 
     if (err) *err = WCCS_OK;
 
@@ -300,11 +436,18 @@ wccs_ctx* wccs_new(
         e = WCCS_E_INVAL;
         goto fail;
     }
+    if ((uint64_t)n > (uint64_t)(SIZE_MAX / sizeof(uint64_t)) - 1ULL) {
+        e = WCCS_E_NOMEM;              /* exceeds the address space of this target */
+        goto fail;
+    }
     for (i = 0; i < n; ++i) {
         if (w[i] == 0) { e = WCCS_E_INVAL; goto fail; }
         if (W > UINT64_MAX - w[i]) { e = WCCS_E_OVERFLOW; goto fail; }
         W += w[i];
     }
+
+    e = stream_register(seed, stream_id, g_stream_mode, &stream_slot);
+    if (e != WCCS_OK) goto fail;
 
     c = ctx_alloc(n, L);
     if (!c) { e = WCCS_E_NOMEM; goto fail; }
@@ -312,6 +455,7 @@ wccs_ctx* wccs_new(
     c->n = n; c->L = L; c->R = R;
     c->beta_q = beta_q; c->alpha_q = alpha_q;
     c->seed = seed; c->stream_id = stream_id;
+    c->stream_slot = stream_slot;
     c->W_total = W;
     c->rng = rng;
     c->last_err = WCCS_OK;
@@ -326,6 +470,7 @@ wccs_ctx* wccs_new(
 
 fail:
     if (c) wccs_free(c);
+    else   stream_unregister(stream_slot);
     if (err) *err = e;
     return NULL;
 }
@@ -355,7 +500,10 @@ int32_t wccs_sample(wccs_ctx *c, int32_t *err)
 {
     int32_t e = WCCS_OK;
     int32_t i = -1;
+    int32_t k;
+    int32_t excl = -1;
     uint64_t r;
+    uint64_t saved_v = 0;
 
     if (!c) {
         if (err) *err = WCCS_E_NULL;
@@ -363,38 +511,61 @@ int32_t wccs_sample(wccs_ctx *c, int32_t *err)
     }
     c->last_err = WCCS_OK;
 
-    /* Degenerate case: every element is cooled down. Clear the cooldown
-     * queue, restore all cooldown factors and rebuild the Fenwick tree. */
+    /* CONTRACT.md section 4: when every element is cooled down, release the
+     * window and rebuild. The last drawn index is excluded from the first
+     * draw of the new round, so L >= n cannot produce a consecutive repeat
+     * at the round boundary. */
     if (c->total == 0) {
-        int32_t k;
-        for (k = 0; k < c->n; ++k) c->cooldown[k] = ONE_Q32;
-        c->recent_head = 0;
+        for (k = 0; k < c->n; ++k) {
+            c->cooldown[k]   = ONE_Q32;
+            c->cool_count[k] = 0;
+        }
+        c->recent_head  = 0;
         c->recent_count = 0;
         fenwick_rebuild(c);
         if (c->total == 0) { e = WCCS_E_EMPTY; goto out; }
+        if (c->n > 1 && c->last_index >= 0) excl = c->last_index;
+    }
+
+    /* Temporarily give the previous index zero weight. A Fenwick cumulative
+     * search skips zero-weight elements, so this is an unbiased draw from
+     * the remaining n-1 elements without consuming extra randomness. */
+    if (excl >= 0 && c->cur[excl] > 0) {
+        saved_v = c->cur[excl];
+        fenwick_set(c, excl, 0);
+        if (c->total == 0) {          /* nothing else is available */
+            fenwick_set(c, excl, saved_v);
+            excl = -1;
+        }
+    } else {
+        excl = -1;
     }
 
     r = random_below(c, c->total);
     i = fenwick_find_by_cumulative(c, r);
-    if (i < 0 || i >= c->n) { e = WCCS_E_STATE; goto out; }
+    if (excl >= 0) fenwick_set(c, excl, saved_v);
+    if (i < 0 || i >= c->n || i == excl) { e = WCCS_E_STATE; goto out; }
 
     c->actual[i] += 1;
     c->step += 1;
+    c->last_index = i;
 
-    /* Cooldown window: keep the most recent L indices cooled. The window has
-     * capacity L; when full, the oldest slot is released before the new one
-     * is written. This yields L=1 => "no consecutive repeats" and
-     * L>=n + beta_q=0 + equal weights => random permutation each round,
-     * exactly as required by the degeneracy table in work.md section 1.6. */
+    /* CONTRACT.md section 2: the window holds the last L draws with
+     * reference counting. Releasing the oldest slot restores an index only
+     * when no newer occurrence of it remains in the window. */
     if (c->L > 0) {
         if (c->recent_count == c->L) {
             int32_t j = c->recent[c->recent_head];  /* oldest when full */
             c->recent_count--;
-            c->cooldown[j] = ONE_Q32;
-            fenwick_set(c, j, calc_v(c, j));
+            if (c->cool_count[j] > 0) c->cool_count[j]--;
+            if (c->cool_count[j] == 0) {
+                c->cooldown[j] = ONE_Q32;
+                fenwick_set(c, j, calc_v(c, j));
+            }
         }
         c->cooldown[i] = c->beta_q;
         fenwick_set(c, i, calc_v(c, i));
+        c->cool_count[i]++;
         c->recent[c->recent_head] = i;
         c->recent_head = (c->recent_head + 1) % c->L;
         c->recent_count++;
@@ -420,6 +591,8 @@ const char* wccs_error_string(int32_t err)
         case WCCS_E_EMPTY:    return "all dynamic weights are zero";
         case WCCS_E_NULL:     return "null context";
         case WCCS_E_STATE:    return "internal state error";
+        case WCCS_E_STREAM_CONFLICT:
+                              return "duplicate live (seed, stream_id)";
         default:              return "unknown error";
     }
 }

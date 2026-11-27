@@ -237,6 +237,22 @@ static void t_credit_reproducibility(void)
     wccs_free(a); wccs_free(b);
 }
 
+/* 32-bit targets: n * sizeof(uint64_t) must not wrap size_t. */
+static void t_capacity(void)
+{
+    uint64_t w[1] = {1};
+    int32_t e = -1;
+    wccs_ctx *c;
+#if SIZE_MAX < UINT64_MAX
+    c = wccs_new_default(600000000, w, 0, 0, 0, 1, 1, 0, &e);
+    CHECK(c == NULL && e == WCCS_E_NOMEM, "oversized n is a clean capacity error");
+    wccs_free(c);
+#else
+    (void)w; (void)e; (void)c;
+    CHECK(1, "64-bit target: capacity guard is not reachable");
+#endif
+}
+
 /* Read-only helpers. */
 static void t_helpers(void)
 {
@@ -255,6 +271,49 @@ static void t_helpers(void)
     wccs_free(c);
 }
 
+/* Optional duplicate (seed, stream_id) detector - CONTRACT.md section 5.
+ * Runs late and restores mode 0 so other tests may keep same-key contexts. */
+static void t_stream_conflict(void)
+{
+    uint64_t w[4] = {1, 1, 1, 1};
+    int32_t e = 0;
+    wccs_ctx *a, *b;
+    int32_t prev;
+
+    prev = wccs_stream_check(2);
+    CHECK(prev == 0, "detector is off by default");
+    CHECK(wccs_stream_check_mode() == 2, "mode can be set");
+
+    a = wccs_new_default(4, w, 0, 0, 0, 1, 7, 7, &e);
+    CHECK(a != NULL && e == 0, "first key registers");
+
+    e = 0;
+    b = wccs_new_default(4, w, 0, 0, 0, 1, 7, 7, &e);
+    CHECK(b == NULL && e == WCCS_E_STREAM_CONFLICT, "duplicate live key rejected");
+
+    e = 0;
+    b = wccs_new_default(4, w, 0, 0, 0, 1, 7, 8, &e);
+    CHECK(b != NULL && e == 0, "distinct stream_id accepted");
+    wccs_free(b);
+
+    wccs_free(a);
+    e = 0;
+    a = wccs_new_default(4, w, 0, 0, 0, 1, 7, 7, &e);
+    CHECK(a != NULL && e == 0, "key is reusable after wccs_free");
+    wccs_free(a);
+
+    wccs_stream_check(1);
+    e = 0;
+    a = wccs_new_default(4, w, 0, 0, 0, 1, 9, 9, &e);
+    b = wccs_new_default(4, w, 0, 0, 0, 1, 9, 9, &e);
+    CHECK(a != NULL && b != NULL, "warn mode never fails a construction");
+    wccs_free(a);
+    wccs_free(b);
+
+    wccs_stream_check(0);
+    CHECK(wccs_stream_check_mode() == 0, "detector restored to off");
+}
+
 int main(void)
 {
     RUN("reproducibility",              t_reproducibility);
@@ -266,6 +325,8 @@ int main(void)
     RUN("error codes",                  t_errors);
     RUN("credit rebuild determinism",   t_credit_reproducibility);
     RUN("helpers",                      t_helpers);
+    RUN("32-bit capacity guard",        t_capacity);
+    RUN("stream conflict detector",     t_stream_conflict);
     printf("\n%d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

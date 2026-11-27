@@ -1,6 +1,6 @@
 {
   "name": "@yuanyuan5510/wccs",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "WCCS (Weighted Credit-Cooldown Sampler) Node.js binding",
   "license": "Apache-2.0",
   "publishConfig": { "access": "public" },

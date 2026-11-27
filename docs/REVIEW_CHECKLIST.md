@@ -10,7 +10,13 @@ Status as of this implementation. Re-run before every release.
       zero `free` calls on core pointers.
 - [x] All bindings inject the same deterministic PRNG by default
       (`wccs_new_default` → core PCG RXS-M-XS 64/64). Custom injection
-      downgrades to L0/L1 and is documented in `docs/IMPLEMENTATION_NOTES.md`.
+      downgrades to L0/L1 and is documented in `docs/CONTRACT.md` §7.
+- [x] [`docs/CONTRACT.md`](CONTRACT.md) is implemented and covered: cooldown
+      reference counting (§2), soft-cooldown floor (§3), `total == 0`
+      boundary exclusion (§4), optional stream-conflict detection (§5).
+- [x] The `(seed, stream_id)` detector defaults to off, is append-only in the
+      ABI (`WCCS_E_STREAM_CONFLICT = 7`), and never fails a valid
+      construction just because the registry is full.
 - [x] `random_below` (Lemire) lives in the core; no binding generates indices.
 - [x] Weights, factors and Fenwick tree are integer / Q32 only; no float.
 - [ ] Python wheel passes a `manylinux` audit — **not yet run**; CI builds
@@ -24,7 +30,7 @@ Status as of this implementation. Re-run before every release.
 - [x] Cross-language fixed vector SHA-256 matches
       (`tests/run_cross_lang.py`, 7/7 entry points).
 - [x] Cooldown, coverage, boundary, frequency and unbiased-mapping tests pass
-      (`ctest`, 48 793 checks, 0 failures).
+      (`ctest`, 48 802 checks, 0 failures).
 - [x] Error codes and exception mappings are consistent across languages.
 
 ## Release pipeline status

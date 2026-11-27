@@ -55,10 +55,12 @@
 ### 1.2 动态权重计算
 
 ```text
-v_i = max(0, w_i + (alpha_q * credit_i) >> 32) * cooldown_i >> 32
+delta = (alpha_q * credit_i) >> 64            // Q32 × Q32 = Q64 → 整数
+base  = max(0, w_i + delta)
+v_i   = (base * cooldown_i) >> 32             // Q32 冷却因子
 ```
 
-所有乘法用 `__int128` 或高精度中间类型防止溢出；`>> 32` 是 Q32 定点还原。
+`credit_i` 与 `alpha_q` 都是 Q32，乘积为 Q64，因此归约用 `>> 64`；冷却因子再单独用 `>> 32` 还原。所有乘法用 128 位中间量防止溢出。若 `base > 0` 且 `0 < cooldown_i < 2^32` 而结果被截断为 0，必须保底为 1，否则小整数权重下的"软冷却"会静默退化为硬冷却。权威裁决见 [`docs/CONTRACT.md`](docs/CONTRACT.md) §3。
 
 ### 1.3 无偏随机映射（Lemire）
 
@@ -93,15 +95,18 @@ int32_t i = fenwick_find_by_cumulative(r);       // Fenwick 前缀和定位
 actual[i] += 1;
 step += 1;
 
-// 冷却更新
+// 冷却更新（窗口按"出现次数"计数，见 docs/CONTRACT.md §2）
+if (recent_count == L) {                          // 先释放最旧槽，再写入新索引
+    int32_t j = recent_pop_oldest();
+    if (--cool_count[j] == 0) {                   // 窗口内仍有 j 时保持冷却
+        cooldown[j] = 1ULL << 32;
+        fenwick_update(j, calc_v(j));
+    }
+}
 cooldown[i] = beta_q;                             // beta_q=0 严格，beta_q=1<<32 无冷却
+cool_count[i]++;
 fenwick_update(i, calc_v(i));
 recent_push(i);                                   // 环形缓冲
-if (recent_count == L) {
-    int32_t j = recent_pop_oldest();
-    cooldown[j] = 1ULL << 32;
-    fenwick_update(j, calc_v(j));
-}
 
 // 信用重建
 if (step % R == 0) rebuild_credit();
@@ -127,7 +132,9 @@ fenwick_rebuild(v)
 | `L=1, beta_q=0` | 禁止连续相同 |
 | `L≥n, beta_q=0, w` 等权 | 每轮无放回随机排列 |
 | `beta_q>0` | 软冷却，高权重不会长期被压死 |
-| `total=0` | 清空冷却队列，恢复所有 `cooldown=1<<32`，重建 Fenwick |
+| `total=0` | 释放窗口并重建 Fenwick；新一轮的第一次抽样排除上一次索引（见 [`docs/CONTRACT.md`](docs/CONTRACT.md) §4） |
+
+> `L≥n` 时"最近 L 次互不相同"在只有 n 个元素时物理上不可满足。契约的降级保证是：**每 n 次抽样仍是一轮随机排列，且任意 L 下都不出现相邻重复**；距离 `2..L` 的重复是必然结果，不算违约。
 
 
 ## 2. C 核心设计（唯一事实来源）

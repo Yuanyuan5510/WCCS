@@ -80,9 +80,10 @@ their product is Q64 and must be reduced by `>> 64` to recover an integer
 count adjustment. The Q32 cooldown factor is then applied with `>> 32`. Use
 128-bit intermediates; never overflow.
 
-> The manual's pseudocode writes `>> 32` here. That mixes Q64 and integer
-> units; the implemented and dimensionally consistent form uses `>> 64`.
-> See [`docs/IMPLEMENTATION_NOTES.md`](docs/IMPLEMENTATION_NOTES.md) §2.
+> `credit_i` and `alpha_q` are both Q32, so their product is Q64 and the
+> reduction is `>> 64`; the Q32 cooldown factor is applied separately with
+> `>> 32`. A strictly positive soft factor must not truncate a positive base
+> to zero. The binding ruling is [`docs/CONTRACT.md`](docs/CONTRACT.md) §3.
 
 ### 1.3 Unbiased bounded mapping (Lemire)
 
@@ -112,7 +113,9 @@ itself; all sampling goes through `wccs_sample`.
 ### 1.4 Sampling
 
 ```text
-if total == 0: clear cooldown queue, rebuild Fenwick
+if total == 0:
+    release the window (cooldown = 1<<32, cool_count = 0), rebuild Fenwick
+    exclude the previous index from this draw   # CONTRACT §4
 
 r = random_below(total)
 i = fenwick_find_by_cumulative(r)
@@ -120,23 +123,24 @@ i = fenwick_find_by_cumulative(r)
 actual[i] += 1
 step += 1
 
+if recent_count == L:                # release oldest before writing (CONTRACT §2)
+    j = recent_pop_oldest()
+    if --cool_count[j] == 0:
+        cooldown[j] = 1 << 32
+        fenwick_update(j, calc_v(j))
 cooldown[i] = beta_q
+cool_count[i] += 1
 fenwick_update(i, calc_v(i))
 recent_push(i)
-if recent_count > L:
-    j = recent_pop_oldest()
-    cooldown[j] = 1 << 32
-    fenwick_update(j, calc_v(j))
 
 if step % R == 0: rebuild_credit()
 return i
 ```
 
-> The manual writes `if (recent_count == L)` after the push. Taken literally
-> with `L=1, beta_q=0` it would restore the element that was just picked and
-> allow consecutive repeats, contradicting §1.6. The implemented equivalent
-> releases the oldest entry before writing the new one, so exactly the last
-> `L` indices stay cooled. See `docs/IMPLEMENTATION_NOTES.md` §1.
+> The window is released *before* the new index is written, and it counts
+> occurrences: an index stays cooled until its last occurrence leaves the
+> window. This is what makes `beta_q > 0` well defined when the same index is
+> drawn twice inside one window. See [`docs/CONTRACT.md`](docs/CONTRACT.md) §2.
 
 ### 1.5 Credit rebuild
 
@@ -158,7 +162,12 @@ fenwick_rebuild(v)
 | `L=1, beta_q=0` | no consecutive repeats |
 | `L>=n, beta_q=0`, equal weights | a full random permutation every round |
 | `beta_q>0` | soft cooldown; high weights are not starved |
-| `total=0` | clear cooldown queue, restore `cooldown=1<<32`, rebuild Fenwick |
+| `total=0` | release the window, rebuild Fenwick, exclude the previous index from the new round (see [`docs/CONTRACT.md`](docs/CONTRACT.md) §4) |
+
+> With `L >= n`, "the last L draws are distinct" is unsatisfiable for a
+> population of `n`. The contract degrades to: every block of `n` draws is a
+> random permutation, and consecutive repeats never occur for any `L`.
+> Repeats at distances `2..L` are a mathematical consequence, not a violation.
 
 ---
 

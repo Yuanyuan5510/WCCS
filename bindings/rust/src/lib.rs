@@ -37,6 +37,9 @@ pub mod error {
     pub const E_EMPTY: i32 = 4;
     pub const E_NULL: i32 = 5;
     pub const E_STATE: i32 = 6;
+    /// Two live contexts share `(seed, stream_id)`; only when the optional
+    /// detector is enabled through the C API.
+    pub const E_STREAM_CONFLICT: i32 = 7;
 }
 
 #[derive(Debug, Clone)]

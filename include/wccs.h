@@ -1,5 +1,7 @@
 /* WCCS - Weighted Credit-Cooldown Sampler
  * Versioned C ABI. This header is the single stable contract (see docs/ABI.md).
+ * Behavioural rulings for cases the manual leaves undefined or contradictory
+ * live in docs/CONTRACT.md; they are authoritative over work.md.
  *
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -28,7 +30,9 @@ enum {
     WCCS_E_OVERFLOW = 3,  /* sum of weights exceeds uint64                    */
     WCCS_E_EMPTY    = 4,  /* all dynamic weights are zero; cannot sample      */
     WCCS_E_NULL     = 5,  /* NULL context passed to a method                  */
-    WCCS_E_STATE    = 6   /* internal invariant violated (defensive)          */
+    WCCS_E_STATE    = 6,  /* internal invariant violated (defensive)          */
+    WCCS_E_STREAM_CONFLICT = 7  /* two live contexts share (seed, stream_id);
+                                   only reported when the optional check is on */
 };
 
 #if defined(_WIN32) && !defined(WCCS_STATIC)
@@ -89,6 +93,19 @@ WCCS_API const char* wccs_error_string(int32_t err); /* static string, DO NOT fr
 WCCS_API uint64_t    wccs_step(const wccs_ctx *c);
 WCCS_API uint64_t    wccs_total(const wccs_ctx *c);
 WCCS_API int32_t     wccs_last_error(const wccs_ctx *c);
+
+/* Optional debug aid (ABI 1, append-only). Disabled by default.
+ * Two simultaneously live contexts constructed with the same
+ * (seed, stream_id) produce identical sequences: intentional for L2
+ * reproducibility tests, a silent bug in parallel runs.
+ *
+ *   mode 0 = off (default), 1 = warn on stderr, 2 = fail construction
+ *   with WCCS_E_STREAM_CONFLICT.
+ *
+ * Returns the previous mode. Set it before creating any context; the
+ * toggle itself is not thread-safe. See docs/CONTRACT.md section 5. */
+WCCS_API int32_t wccs_stream_check(int32_t mode);
+WCCS_API int32_t wccs_stream_check_mode(void);
 
 #ifdef __cplusplus
 }

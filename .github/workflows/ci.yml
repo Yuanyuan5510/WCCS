@@ -94,6 +94,24 @@ jobs:
       - name: Test C core matrix + C++ binding
         run: ctest --test-dir build -C Release --output-on-failure
 
+      # The amalgamated files are checked in; regenerate and fail if they
+      # drifted, then prove both forms compile and reproduce the vector.
+      - name: Amalgamated single-file builds (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python tools/amalgamate.py
+          if ! git diff --quiet -- single_header single_source; then
+            echo "::error::single_header/single_source are stale; run python tools/amalgamate.py"
+            exit 1
+          fi
+          cc -O2 -std=c99 -Wall -Wextra -Werror -DWCCS_IMPLEMENTATION -DWCCS_STATIC \
+             -Isingle_header tests/test_vector.c tests/sha256.c -o "$RUNNER_TEMP/vec_amalg"
+          "$RUNNER_TEMP/vec_amalg"
+          cc -O2 -std=c99 -Wall -Wextra -Werror -DWCCS_STATIC -Iinclude \
+             tests/test_vector.c tests/sha256.c single_source/wccs.c -o "$RUNNER_TEMP/vec_single"
+          "$RUNNER_TEMP/vec_single"
+
       - name: Verify installed pkg-config / CMake package (Linux)
         if: runner.os == 'Linux'
         shell: bash
@@ -108,6 +126,59 @@ jobs:
           echo "pkg-config file: $PC"
           PKG_CONFIG_PATH="$(dirname "$PC")" pkg-config --cflags --libs wccs
           test -n "$(find _install_pc -name wccs-config.cmake | head -1)"
+
+  # ---------------------------------------------------------------- stage 1b
+  core32:
+    name: core 32-bit (${{ matrix.name }})
+    needs: version-check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            name: i686-linux
+          - os: windows-2022
+            name: x86-windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install 32-bit multilib
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib g++-multilib
+
+      - name: Configure (-m32)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B build32 -DCMAKE_BUILD_TYPE=Release -DWCCS_BUILD_TESTS=ON \
+                -DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 \
+                -DCMAKE_EXE_LINKER_FLAGS=-m32 -DCMAKE_SHARED_LINKER_FLAGS=-m32
+
+      - name: Configure (Win32)
+        if: runner.os == 'Windows'
+        run: cmake -B build32 -A Win32 -DWCCS_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build32 --config Release --parallel 4
+
+      - name: Test 32-bit core matrix
+        run: ctest --test-dir build32 -C Release --output-on-failure
+
+      - name: 32-bit single-file builds (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python tools/amalgamate.py
+          cc -m32 -O2 -std=c99 -Wall -Wextra -Werror -DWCCS_STATIC -Iinclude \
+             tests/test_vector.c tests/sha256.c single_source/wccs.c \
+             -o "$RUNNER_TEMP/vec32"
+          "$RUNNER_TEMP/vec32"
+          cc -m32 -O2 -std=c99 -Wall -Wextra -Werror -DWCCS_IMPLEMENTATION \
+             -DWCCS_STATIC -Isingle_header tests/test_vector.c tests/sha256.c \
+             -o "$RUNNER_TEMP/vec32h"
+          "$RUNNER_TEMP/vec32h"
 
   # ---------------------------------------------------------------- stage 2
   bindings:
@@ -293,7 +364,9 @@ jobs:
           const pkg = JSON.parse(fs.readFileSync(p, 'utf8'));
           pkg.optionalDependencies = {
             '@yuanyuan5510/wccs-win32-x64': version,
+            '@yuanyuan5510/wccs-win32-ia32': version,
             '@yuanyuan5510/wccs-linux-x64-gnu': version,
+            '@yuanyuan5510/wccs-linux-ia32': version,
             '@yuanyuan5510/wccs-darwin-arm64': version,
           };
           fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + '\n');
@@ -332,10 +405,84 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  # ---------------------------------------------------------------- stage 4b
+  package-32bit:
+    name: package 32-bit (win-x86 + linux-i686)
+    needs: [version-check, core32]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install 32-bit toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib gcc-mingw-w64-i686
+
+      - name: Build Linux i686 and Windows x86 libraries
+        shell: bash
+        run: |
+          mkdir -p dist/native/linux-x86 dist/native/win-x86
+          gcc -m32 -O2 -std=c99 -Wall -Wextra -Werror -fPIC -shared \
+              -DWCCS_BUILD_DLL -Iinclude src/wccs.c \
+              -o dist/native/linux-x86/libwccs.so
+          i686-w64-mingw32-gcc -O2 -std=c99 -Wall -Wextra -Werror -shared \
+              -DWCCS_BUILD_DLL -Iinclude src/wccs.c \
+              -o dist/native/win-x86/libwccs.dll \
+              -static-libgcc -static
+          file dist/native/linux-x86/libwccs.so dist/native/win-x86/libwccs.dll
+
+      - name: Python wheels (win32 + manylinux i686)
+        shell: bash
+        run: |
+          python -m pip install --upgrade build
+          GLIBC=$(getconf GNU_LIBC_VERSION | awk '{print $2}' | tr '.' '_')
+          mkdir -p dist/wheels
+          cp dist/native/linux-x86/libwccs.so bindings/python/wccs/
+          python -m build --wheel --outdir dist/wheels \
+            --config-setting="--build-option=--plat-name=manylinux_${GLIBC}_i686" \
+            bindings/python
+          rm -f bindings/python/wccs/libwccs.so
+          cp dist/native/win-x86/libwccs.dll bindings/python/wccs/
+          python -m build --wheel --outdir dist/wheels \
+            --config-setting="--build-option=--plat-name=win32" bindings/python
+          rm -f bindings/python/wccs/libwccs.dll
+          ls -l dist/wheels
+
+      - name: npm platform packages (ia32)
+        shell: bash
+        run: |
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          for spec in win32-ia32:win32:ia32:win-x86:libwccs.dll \
+                      linux-ia32:linux:ia32:linux-x86:libwccs.so; do
+            IFS=: read -r SUFFIX OS CPU RID LIB <<< "$spec"
+            DIR="dist/npm-platform/wccs-$SUFFIX"
+            mkdir -p "$DIR"
+            cp "dist/native/$RID/$LIB" "$DIR/"
+            python3 -c 'import json,sys;d,suf,ver,osn,cpu=sys.argv[1:6];json.dump({"name":"@yuanyuan5510/wccs-"+suf,"version":ver,"description":"Prebuilt WCCS native library for "+osn+"-"+cpu,"license":"Apache-2.0","publishConfig":{"access":"public"},"os":[osn],"cpu":[cpu],"files":["*.dll","*.so"],"repository":{"type":"git","url":"https://github.com/Yuanyuan5510/WCCS.git"}},open(d+"/package.json","w"),indent=2)' \
+              "$DIR" "$SUFFIX" "$VERSION" "$OS" "$CPU"
+          done
+          ls -R dist/npm-platform
+
+      - name: Bundle 32-bit artifacts
+        shell: bash
+        run: python -c "import shutil; shutil.make_archive('wccs-32bit-artifacts','zip','dist')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wccs-dist-32bit
+          path: wccs-32bit-artifacts.zip
+          retention-days: 14
+          if-no-files-found: error
+
   # ---------------------------------------------------------------- stage 5
   release:
     name: publish GitHub Release
-    needs: [package, wasm]
+    needs: [package, package-32bit, wasm]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions:
@@ -360,7 +507,7 @@ jobs:
   # ---------------------------------------------------------------- stage 6
   publish-pypi:
     name: publish to PyPI
-    needs: [package]
+    needs: [package, package-32bit]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     # Environment-scoped secrets are only visible to jobs that declare the
@@ -443,7 +590,7 @@ jobs:
   # ---------------------------------------------------------------- stage 7
   publish-npm:
     name: publish to npm
-    needs: [package]
+    needs: [package, package-32bit]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     environment: release
@@ -511,7 +658,7 @@ jobs:
   # ---------------------------------------------------------------- stage 8
   publish-nuget:
     name: publish to NuGet
-    needs: [package]
+    needs: [package, package-32bit]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     environment: release
@@ -531,6 +678,18 @@ jobs:
           mkdir -p native
           for z in $(find bundles -name '*.zip'); do
             case "$(basename "$z")" in
+              # One 32-bit bundle carries both RIDs under dist/native/<rid>/.
+              *32bit*)
+                mkdir -p unpack32
+                unzip -o -q "$z" -d unpack32
+                for rid in win-x86 linux-x86; do
+                  lib=$(find unpack32 -path "*native/$rid/*" -type f | head -1)
+                  if [ -n "$lib" ]; then
+                    mkdir -p "native/$rid"
+                    cp "$lib" "native/$rid/"
+                  fi
+                done
+                continue ;;
               *windows*) rid=win-x64 ;;
               *ubuntu*)  rid=linux-x64 ;;
               *macos*)   rid=osx-arm64 ;;
